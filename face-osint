@@ -118,6 +118,7 @@ def cmd_search(args):
         print("  --depth N     Graph depth (0=user only, 1=followers/following, 2=their friends, ...)")
         print("  --workers N   Parallel workers (default 3)")
         print("  --threshold X Match threshold 0-1 (default 0.35)")
+        print("  --no-cache    Re-scrape followers/following, ignore saved cache")
         print("")
         print("Examples:")
         print("  face-osint search ref.jpg target_user --depth 1")
@@ -130,6 +131,7 @@ def cmd_search(args):
     workers = config.WORKERS
     threshold = config.SIM_THRESHOLD
     depth = 1
+    no_cache = False
 
     i = 2
     while i < len(args):
@@ -139,6 +141,8 @@ def cmd_search(args):
             threshold = float(args[i + 1]); i += 2
         elif args[i] == "--depth" and i + 1 < len(args):
             depth = int(args[i + 1]); i += 2
+        elif args[i] == "--no-cache":
+            no_cache = True; i += 1
         else:
             i += 1
 
@@ -179,8 +183,11 @@ def cmd_search(args):
     followers_path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
     following_path = os.path.join(config.DATA_DIR, f"{username}_following.json")
 
-    if not os.path.exists(followers_path) or not os.path.exists(following_path):
-        print(f"\nScraping followers/following of @{username}...")
+    if no_cache or not os.path.exists(followers_path) or not os.path.exists(following_path):
+        if no_cache:
+            print(f"\n--no-cache: re-scraping @{username}...")
+        else:
+            print(f"\nScraping followers/following of @{username}...")
         ig = Instagram(cookie)
 
         print("  Fetching followers...")
