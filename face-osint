@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+Face OSINT — Instagram Face Search Toolkit
+
+Commands:
+  compare   <ref_image> <target_image>          Compare two face images
+  search    <ref_image> <username> [options]    Recursive face-search through social graph
+    --depth N    Graph depth (1=direct, 2=friends-of-friends, 3=...)
+    --workers N  Parallel checks (default 3)
+    --threshold X  Match threshold 0-1 (default 0.35)
+  scrape    <username> [options]                Scrape followers/following lists
+  pic       <username> [options]                Download profile picture
+  list      <file>                              List results from a saved search
+
+Global options (use before command):
+  --cookie "<string>"     Instagram cookie string (env: IG_COOKIE)
+  --cookies <file>        Path to cookies.txt file
+
+Search depth examples:
+  # Depth 1 — check followers/following of @target
+  ./face-osint search ref.jpg target --depth 1
+
+  # Depth 2 — check followers/following, then their friends too
+  ./face-osint search ref.jpg target --depth 2 --workers 4
+
+  # Depth 3 — deeper
+  ./face-osint search ref.jpg target --depth 3 --threshold 0.3
+
+  # With custom cookie
+  ./face-osint --cookie "sessionid=..." search ref.jpg target --depth 2
+
+Other examples:
+  IG_COOKIE="sessionid=..." ./face-osint scrape username
+  ./face-osint compare face1.jpg face2.jpg
+"""
+import sys, os, json, time, cv2, numpy as np
+from numpy.linalg import norm
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+
+from modules.instagram import Instagram
+from modules.face import FaceEngine
+from modules.search import BFSSearch
+from modules import config
+
+def resolve_cookie():
+    """Resolve cookie: --cookie > --cookies file > IG_COOKIE env > config default."""
+    if hasattr(resolve_cookie, "_cached"):
+        return resolve_cookie._cached
+
+    raw = None
+
+    # Check --cookies <file>
+    for i, arg in enumerate(sys.argv):
+        if arg == "--cookies" and i + 1 < len(sys.argv):
+            path = sys.argv[i + 1]
+            if os.path.exists(path):
+                with open(path) as f:
+                    raw = f.read().strip()
+                # pop both args so commands don't see them
+                sys.argv.pop(i + 1)
+                sys.argv.pop(i)
+                break
+
+    # Check --cookie <string>
+    if raw is None:
+        for i, arg in enumerate(sys.argv):
+            if arg == "--cookie" and i + 1 < len(sys.argv):
+                raw = sys.argv[i + 1]
+                sys.argv.pop(i + 1)
+                sys.argv.pop(i)
+                break
+
+    if raw is None:
+        raw = os.environ.get("IG_COOKIE")
+
+    if raw is None:
+        raw = config.COOKIE_STRING
+
+    resolve_cookie._cached = raw
+    return raw
+
+def cmd_compare(args):
+    """Compare two face images."""
+    if len(args) < 2:
+        print("Usage: face-osint compare <ref_image> <target_image>")
+        return 1
+    ref_path, target_path = args[0], args[1]
+
+    engine = FaceEngine()
+    ref_emb = engine.get_embedding_from_path(ref_path)
+    target_emb = engine.get_embedding_from_path(target_path)
+
+    if ref_emb is None:
+        print("Error: No face detected in reference image.")
+        return 1
+    if target_emb is None:
+        print("Error: No face detected in target image.")
+        return 1
+
+    sim = engine.compare(ref_emb, target_emb)
+    pct = sim * 100
+    threshold = config.SIM_THRESHOLD
+
+    print(f"  Reference: {ref_path}")
+    print(f"  Target:    {target_path}")
+    print(f"  Similarity: {pct:.2f}%")
+    print(f"  Threshold:  {threshold*100:.0f}%")
+    print(f"  Match:      {'YES' if sim >= threshold else 'NO'}")
+    return 0
+
+def cmd_search(args):
+    """Face-search through an Instagram user's social graph."""
+    if len(args) < 2:
+        print("Usage: face-osint search <ref_image> <instagram_username> [options]")
+        print("Options:")
+        print("  --depth N     Graph depth (0=user only, 1=followers/following, 2=their friends, ...)")
+        print("  --workers N   Parallel workers (default 3)")
+        print("  --threshold X Match threshold 0-1 (default 0.35)")
+        print("")
+        print("Examples:")
+        print("  face-osint search ref.jpg target_user --depth 1")
+        print("  face-osint search ref.jpg target_user --depth 3 --workers 5")
+        return 1
+    ref_path = args[0]
+    username = args[1]
+    cookie = resolve_cookie()
+
+    workers = config.WORKERS
+    threshold = config.SIM_THRESHOLD
+    depth = 1
+
+    i = 2
+    while i < len(args):
+        if args[i] == "--workers" and i + 1 < len(args):
+            workers = int(args[i + 1]); i += 2
+        elif args[i] == "--threshold" and i + 1 < len(args):
+            threshold = float(args[i + 1]); i += 2
+        elif args[i] == "--depth" and i + 1 < len(args):
+            depth = int(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    if not os.path.exists(ref_path):
+        print(f"Error: Reference image not found: {ref_path}")
+        return 1
+
+    print("Initializing face engine...")
+    engine = FaceEngine()
+    ref_emb = engine.get_embedding_from_path(ref_path)
+    if ref_emb is None:
+        print("Error: No face detected in reference image.")
+        return 1
+    ref_img = cv2.imread(ref_path)
+    print(f"  Reference: {ref_img.shape[1]}x{ref_img.shape[0]}")
+    print(f"  Threshold: {threshold*100:.0f}%")
+    print(f"  Workers:   {workers}")
+    print(f"  Depth:     {depth}")
+
+    if depth == 0:
+        print(f"\nChecking @{username}...")
+        ig = Instagram(cookie)
+        _, pic = ig.get_profile_pic(username)
+        ig.close()
+        if pic:
+            sim = engine.compare_to_ref(pic, ref_emb)
+            if sim is not None:
+                print(f"  Similarity: {sim*100:.2f}%")
+                if sim >= threshold:
+                    print(f"  >>> MATCH! @{username}")
+            else:
+                print("  No face detected in profile pic.")
+        else:
+            print("  Could not get profile pic.")
+        return 0
+
+    # Scrape followers/following lists
+    followers_path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
+    following_path = os.path.join(config.DATA_DIR, f"{username}_following.json")
+
+    if not os.path.exists(followers_path) or not os.path.exists(following_path):
+        print(f"\nScraping followers/following of @{username}...")
+        ig = Instagram(cookie)
+
+        print("  Fetching followers...")
+        followers = ig.get_followers(username)
+        if followers:
+            json.dump(followers, open(followers_path, "w"))
+            print(f"  Saved {len(followers)} followers")
+        else:
+            print("  Followers API rate-limited, try page-based scrape.")
+            followers = []
+
+        print("  Fetching following...")
+        following = ig.get_following(username)
+        if following:
+            json.dump(following, open(following_path, "w"))
+            print(f"  Saved {len(following)} following")
+        else:
+            print("  Following API rate-limited, try page-based scrape.")
+            following = []
+
+        ig.close()
+    else:
+        followers = json.load(open(followers_path))
+        following = json.load(open(following_path))
+        print(f"  Loaded {len(followers)} followers, {len(following)} following from cache")
+
+    layer0 = list(dict.fromkeys(followers + following))
+    print(f"\nLayer 0: {len(layer0)} unique accounts")
+    print(f"Searching with {workers} parallel workers...")
+
+    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers)
+    t0 = time.time()
+    results = searcher.search(layer0, depth=depth)
+    elapsed = time.time() - t0
+
+    print(f"\nDone in {elapsed:.0f}s")
+    print(f"Faces detected: {len(searcher.results)}")
+
+    top = searcher.get_top(20)
+    print(f"\nTop 20:")
+    for u, s in top:
+        mark = " <<<" if s >= threshold else ""
+        print(f"  @{u}: {s*100:.1f}%{mark}")
+
+    if searcher.found_data[0]:
+        u, s = searcher.found_data[0]
+        print(f"\n{'='*55}")
+        print(f"  FOUND! @{u}  |  {s*100:.2f}%")
+        print(f"  https://instagram.com/{u}")
+        print(f"{'='*55}")
+    else:
+        print(f"\nNot found. Best: {top[0][0] if top else 'N/A'} at {top[0][1]*100:.1f}%" if top else "")
+
+    saved = searcher.save_results()
+    print(f"\nResults saved: {saved}")
+    return 0
+
+def cmd_scrape(args):
+    """Scrape followers/following lists."""
+    if len(args) < 1:
+        print("Usage: face-osint scrape <username>")
+        return 1
+    username = args[0]
+    cookie = resolve_cookie()
+
+    ig = Instagram(cookie)
+    print(f"Scraping @{username}...")
+
+    followers = ig.get_followers(username)
+    if followers:
+        path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
+        json.dump(followers, open(path, "w"))
+        print(f"  Followers: {len(followers)} -> {path}")
+
+    following = ig.get_following(username)
+    if following:
+        path = os.path.join(config.DATA_DIR, f"{username}_following.json")
+        json.dump(following, open(path, "w"))
+        print(f"  Following: {len(following)} -> {path}")
+
+    ig.close()
+    return 0
+
+def cmd_pic(args):
+    """Download a user's profile picture."""
+    if len(args) < 1:
+        print("Usage: face-osint pic <username>")
+        return 1
+    username = args[0]
+    cookie = resolve_cookie()
+
+    ig = Instagram(cookie)
+    url, pic = ig.get_profile_pic(username)
+    ig.close()
+
+    if pic:
+        path = os.path.join(config.DATA_DIR, f"{username}_profile.jpg")
+        with open(path, "wb") as f:
+            f.write(pic)
+        print(f"  Downloaded: {path} ({len(pic)} bytes)")
+        print(f"  URL: {url}")
+    else:
+        print("  Could not download profile picture.")
+    return 0
+
+def cmd_list(args):
+    """List results from a saved search file."""
+    if len(args) < 1:
+        path = os.path.join(config.RESULTS_DIR, "face_search_result.json")
+    else:
+        path = args[0]
+
+    if not os.path.exists(path):
+        print(f"File not found: {path}")
+        return 1
+
+    data = json.load(open(path))
+    print(f"Total checked: {data.get('total_checked', '?')}")
+    print(f"Faces detected: {data.get('total_faces', '?')}")
+    print(f"Match: {'YES' if data.get('found') else 'NO'}")
+
+    if data.get("match"):
+        m = data["match"]
+        print(f"  Found: @{m['username']} at {m['similarity']}%")
+
+    print(f"\nTop matches:")
+    for item in data.get("top_50", [])[:20]:
+        print(f"  @{item['username']}: {item['similarity']:.1f}%")
+    return 0
+
+def main():
+    resolve_cookie()
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0 if sys.argv[1:] else 1
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "compare": cmd_compare,
+        "search": cmd_search,
+        "scrape": cmd_scrape,
+        "pic": cmd_pic,
+        "list": cmd_list,
+    }
+
+    if cmd not in commands:
+        print(f"Unknown command: {cmd}")
+        print(f"Available: {', '.join(commands.keys())}")
+        return 1
+
+    return commands[cmd](args)
+
+if __name__ == "__main__":
+    sys.exit(main())
