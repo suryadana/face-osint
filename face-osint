@@ -33,37 +33,33 @@ Other examples:
   IG_COOKIE="sessionid=..." ./face-osint scrape username
   ./face-osint compare face1.jpg face2.jpg
 """
-import sys, os, json, time, cv2, numpy as np
+import sys, os, json, time, cv2, numpy as np, asyncio
 from numpy.linalg import norm
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
-from modules.instagram import Instagram
+from modules.instagram import Instagram, close_shared_browser
 from modules.face import FaceEngine
 from modules.search import BFSSearch
 from modules import config
 
 def resolve_cookie():
-    """Resolve cookie: --cookie > --cookies file > IG_COOKIE env > config default."""
     if hasattr(resolve_cookie, "_cached"):
         return resolve_cookie._cached
 
     raw = None
 
-    # Check --cookies <file>
     for i, arg in enumerate(sys.argv):
         if arg == "--cookies" and i + 1 < len(sys.argv):
             path = sys.argv[i + 1]
             if os.path.exists(path):
                 with open(path) as f:
                     raw = f.read().strip()
-                # pop both args so commands don't see them
                 sys.argv.pop(i + 1)
                 sys.argv.pop(i)
                 break
 
-    # Check --cookie <string>
     if raw is None:
         for i, arg in enumerate(sys.argv):
             if arg == "--cookie" and i + 1 < len(sys.argv):
@@ -82,7 +78,6 @@ def resolve_cookie():
     return raw
 
 def cmd_compare(args):
-    """Compare two face images."""
     if len(args) < 2:
         print("Usage: face-osint compare <ref_image> <target_image>")
         return 1
@@ -110,8 +105,46 @@ def cmd_compare(args):
     print(f"  Match:      {'YES' if sim >= threshold else 'NO'}")
     return 0
 
-def cmd_search(args):
-    """Face-search through an Instagram user's social graph."""
+async def _depth0_check(engine, ref_emb, username, cookie, threshold):
+    async with Instagram(cookie) as ig:
+        _, pic = await ig.get_profile_pic(username)
+    if pic:
+        sim = engine.compare_to_ref(pic, ref_emb)
+        if sim is not None:
+            print(f"  Similarity: {sim*100:.2f}%")
+            if sim >= threshold:
+                print(f"  >>> MATCH! @{username}")
+        else:
+            print("  No face detected in profile pic.")
+    else:
+        print("  Could not get profile pic.")
+
+async def _scrape_user(username, cookie):
+    followers_path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
+    following_path = os.path.join(config.DATA_DIR, f"{username}_following.json")
+
+    async with Instagram(cookie) as ig:
+        print("  Fetching followers...")
+        followers = await ig.get_followers(username)
+        if followers:
+            json.dump(followers, open(followers_path, "w"))
+            print(f"  Saved {len(followers)} followers")
+        else:
+            print("  Followers API rate-limited, try page-based scrape.")
+            followers = []
+
+        print("  Fetching following...")
+        following = await ig.get_following(username)
+        if following:
+            json.dump(following, open(following_path, "w"))
+            print(f"  Saved {len(following)} following")
+        else:
+            print("  Following API rate-limited, try page-based scrape.")
+            following = []
+
+    return followers, following
+
+async def cmd_search(args):
     if len(args) < 2:
         print("Usage: face-osint search <ref_image> <instagram_username> [options]")
         print("Options:")
@@ -164,22 +197,10 @@ def cmd_search(args):
 
     if depth == 0:
         print(f"\nChecking @{username}...")
-        ig = Instagram(cookie)
-        _, pic = ig.get_profile_pic(username)
-        ig.close()
-        if pic:
-            sim = engine.compare_to_ref(pic, ref_emb)
-            if sim is not None:
-                print(f"  Similarity: {sim*100:.2f}%")
-                if sim >= threshold:
-                    print(f"  >>> MATCH! @{username}")
-            else:
-                print("  No face detected in profile pic.")
-        else:
-            print("  Could not get profile pic.")
+        await _depth0_check(engine, ref_emb, username, cookie, threshold)
+        await close_shared_browser()
         return 0
 
-    # Scrape followers/following lists
     followers_path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
     following_path = os.path.join(config.DATA_DIR, f"{username}_following.json")
 
@@ -188,27 +209,7 @@ def cmd_search(args):
             print(f"\n--no-cache: re-scraping @{username}...")
         else:
             print(f"\nScraping followers/following of @{username}...")
-        ig = Instagram(cookie)
-
-        print("  Fetching followers...")
-        followers = ig.get_followers(username)
-        if followers:
-            json.dump(followers, open(followers_path, "w"))
-            print(f"  Saved {len(followers)} followers")
-        else:
-            print("  Followers API rate-limited, try page-based scrape.")
-            followers = []
-
-        print("  Fetching following...")
-        following = ig.get_following(username)
-        if following:
-            json.dump(following, open(following_path, "w"))
-            print(f"  Saved {len(following)} following")
-        else:
-            print("  Following API rate-limited, try page-based scrape.")
-            following = []
-
-        ig.close()
+        followers, following = await _scrape_user(username, cookie)
     else:
         followers = json.load(open(followers_path))
         following = json.load(open(following_path))
@@ -218,9 +219,9 @@ def cmd_search(args):
     print(f"\nLayer 0: {len(layer0)} unique accounts")
     print(f"Searching with {workers} parallel workers...")
 
-    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers)
+    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers, face_engine=engine, ref_emb=ref_emb)
     t0 = time.time()
-    results = searcher.search(layer0, depth=depth)
+    results = await searcher.search(layer0, depth=depth)
     elapsed = time.time() - t0
 
     print(f"\nDone in {elapsed:.0f}s")
@@ -243,45 +244,42 @@ def cmd_search(args):
 
     saved = searcher.save_results()
     print(f"\nResults saved: {saved}")
+    await close_shared_browser()
     return 0
 
-def cmd_scrape(args):
-    """Scrape followers/following lists."""
+async def cmd_scrape(args):
     if len(args) < 1:
         print("Usage: face-osint scrape <username>")
         return 1
     username = args[0]
     cookie = resolve_cookie()
 
-    ig = Instagram(cookie)
-    print(f"Scraping @{username}...")
+    async with Instagram(cookie) as ig:
+        print(f"Scraping @{username}...")
 
-    followers = ig.get_followers(username)
-    if followers:
-        path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
-        json.dump(followers, open(path, "w"))
-        print(f"  Followers: {len(followers)} -> {path}")
+        followers = await ig.get_followers(username)
+        if followers:
+            path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
+            json.dump(followers, open(path, "w"))
+            print(f"  Followers: {len(followers)} -> {path}")
 
-    following = ig.get_following(username)
-    if following:
-        path = os.path.join(config.DATA_DIR, f"{username}_following.json")
-        json.dump(following, open(path, "w"))
-        print(f"  Following: {len(following)} -> {path}")
-
-    ig.close()
+        following = await ig.get_following(username)
+        if following:
+            path = os.path.join(config.DATA_DIR, f"{username}_following.json")
+            json.dump(following, open(path, "w"))
+            print(f"  Following: {len(following)} -> {path}")
+    await close_shared_browser()
     return 0
 
-def cmd_pic(args):
-    """Download a user's profile picture."""
+async def cmd_pic(args):
     if len(args) < 1:
         print("Usage: face-osint pic <username>")
         return 1
     username = args[0]
     cookie = resolve_cookie()
 
-    ig = Instagram(cookie)
-    url, pic = ig.get_profile_pic(username)
-    ig.close()
+    async with Instagram(cookie) as ig:
+        url, pic = await ig.get_profile_pic(username)
 
     if pic:
         path = os.path.join(config.DATA_DIR, f"{username}_profile.jpg")
@@ -291,10 +289,10 @@ def cmd_pic(args):
         print(f"  URL: {url}")
     else:
         print("  Could not download profile picture.")
+    await close_shared_browser()
     return 0
 
 def cmd_list(args):
-    """List results from a saved search file."""
     if len(args) < 1:
         path = os.path.join(config.RESULTS_DIR, "face_search_result.json")
     else:
@@ -327,20 +325,19 @@ def main():
     cmd = sys.argv[1]
     args = sys.argv[2:]
 
-    commands = {
-        "compare": cmd_compare,
-        "search": cmd_search,
-        "scrape": cmd_scrape,
-        "pic": cmd_pic,
-        "list": cmd_list,
-    }
+    sync_cmds = {"compare": cmd_compare, "list": cmd_list}
+    async_cmds = {"search": cmd_search, "scrape": cmd_scrape, "pic": cmd_pic}
+    commands = {**sync_cmds, **async_cmds}
 
     if cmd not in commands:
         print(f"Unknown command: {cmd}")
         print(f"Available: {', '.join(commands.keys())}")
         return 1
 
-    return commands[cmd](args)
+    if cmd in async_cmds:
+        return asyncio.run(commands[cmd](args))
+    else:
+        return commands[cmd](args)
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,8 +1,31 @@
 """
-Instagram scraper — Playwright-based, no API needed.
+Instagram scraper — Playwright Async API
 """
-import json, time, re, random
-from playwright.sync_api import sync_playwright
+import json, re, random, asyncio
+from playwright.async_api import async_playwright
+
+# Shared browser — one Playwright instance across all Instagram objects
+_pw = None
+_browser = None
+_browser_lock = asyncio.Lock()
+_owns_browser = False
+
+async def ensure_browser(headless=True):
+    global _pw, _browser
+    if _pw is None:
+        async with _browser_lock:
+            if _pw is None:
+                _pw = await async_playwright().start()
+                _browser = await _pw.chromium.launch(headless=headless)
+
+async def close_shared_browser():
+    global _pw, _browser
+    if _browser:
+        await _browser.close()
+        _browser = None
+    if _pw:
+        await _pw.stop()
+        _pw = None
 
 def parse_cookies(s):
     c = []
@@ -19,311 +42,329 @@ def parse_cookies(s):
         })
     return c
 
-def _backoff_wait(attempt):
+async def _backoff_wait(attempt):
     delay = min(2 ** attempt + random.uniform(0, 1), 30)
     print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})")
-    time.sleep(delay)
+    await asyncio.sleep(delay)
 
 class Instagram:
-    def __init__(self, cookie_string, headless=True, timeout=15000):
+    def __init__(self, cookie_string, timeout=15000, skip_home=False):
+        self.cookie_string = cookie_string
         self.timeout = timeout
-        self.pw = sync_playwright().start()
-        self.browser = self.pw.chromium.launch(headless=headless)
-        self.ctx = self.browser.new_context(
+        self.skip_home = skip_home
+        self.ctx = None
+        self.page = None
+
+    async def __aenter__(self):
+        await ensure_browser()
+        self.ctx = await _browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
-        self.ctx.add_cookies(parse_cookies(cookie_string))
-        self.page = self.ctx.new_page()
-        self._goto_with_retry("https://www.instagram.com/", "domcontentloaded")
-        self.page.wait_for_timeout(2000)
+        await self.ctx.add_cookies(parse_cookies(self.cookie_string))
+        self.page = await self.ctx.new_page()
+        if not self.skip_home:
+            await self._goto_with_retry("https://www.instagram.com/")
+            await self.page.wait_for_timeout(2000)
+        return self
 
-    def _goto_with_retry(self, url, wait_until="domcontentloaded"):
+    async def __aexit__(self, *args):
+        if self.page:
+            await self.page.close()
+        if self.ctx:
+            await self.ctx.close()
+
+    async def _goto_with_retry(self, url, wait_until="domcontentloaded"):
         for attempt in range(5):
             try:
-                r = self.page.goto(url, wait_until=wait_until, timeout=self.timeout)
+                r = await self.page.goto(url, wait_until=wait_until, timeout=self.timeout)
                 if r and r.status == 429:
-                    _backoff_wait(attempt)
-                    continue
-                check = self.page.evaluate("() => document.body ? document.body.innerText.slice(0,200) : ''")
-                if "rate limit" in check.lower() or "please wait" in check.lower():
-                    _backoff_wait(attempt)
-                    continue
-                return r
-            except Exception as e:
-                if attempt < 4:
-                    _backoff_wait(attempt)
-                    continue
-                raise e
-        return None
+                    await _backoff_wait(attempt)
+                else:
+                    return r
+            except Exception:
+                if attempt == 4:
+                    raise
+                await _backoff_wait(attempt)
 
-    def get_profile_pic(self, username):
-        """Download a user's profile picture via page navigation. Returns (url, bytes) or (None, None)."""
-        url = self._get_pic_url(username)
-        if not url: return None, None
-        import requests
+    async def _click_text(self, text):
+        # Try exact match first
         try:
-            r = requests.get(url, headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.instagram.com/"
-            }, timeout=10)
-            if r.status_code == 200: return url, r.content
-        except: pass
-        return None, None
-
-    def _get_pic_url(self, username):
-        try:
-            self._goto_with_retry(f"https://www.instagram.com/{username}/")
-            self.page.wait_for_timeout(1500)
-            imgs = self.page.query_selector_all("img")
-            for img in imgs:
-                src = img.get_attribute("src")
-                alt = img.get_attribute("alt") or ""
-                if src and f"{username}'s profile picture" in alt and ".jpg" in src:
-                    return src
-            for img in imgs:
-                src = img.get_attribute("src")
-                alt = img.get_attribute("alt") or ""
-                if src and "profile picture" in alt and ".jpg" in src and len(src) > 40:
-                    return src
-        except: pass
-        return None
-
-    def download_pic(self, url):
-        import requests
-        try:
-            r = requests.get(url, headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.instagram.com/"
-            }, timeout=10)
-            if r.status_code == 200: return r.content
-        except: pass
-        return None
-
-    def get_followers(self, username):
-        """Fetch follower usernames via page scraping. Falls back to API."""
-        result = self._page_followers(username)
-        if result is not None:
-            return result
-        return self._api_followers(username)
-
-    def get_following(self, username):
-        """Fetch following usernames via page scraping. Falls back to API."""
-        result = self._page_following(username)
-        if result is not None:
-            return result
-        return self._api_following(username)
-
-    def _get_profile_info(self, username):
-        try:
-            self._goto_with_retry(f"https://www.instagram.com/{username}/")
-            self.page.wait_for_timeout(2000)
-            result = self.page.evaluate("""
-() => {
-    var info = {user_id: '', followers: 0, following: 0};
-    var html = document.documentElement.innerHTML;
-
-    var m = html.match(/["']user_id["'][:"]+\\s*(\\d{8,})/);
-    if(m) info.user_id = m[1];
-    m = html.match(/["']pk["'][:"]+\\s*(\\d{8,})/);
-    if(m) info.user_id = m[1];
-
-    var scripts = document.querySelectorAll('script');
-    for(var i = 0; i < scripts.length; i++) {
-        var t = scripts[i].textContent || '';
-        var m2 = t.match(/"user_id":"(\\d+)"/);
-        if(m2) { info.user_id = m2[1]; break; }
-        m2 = t.match(/"pk":"(\\d+)"/);
-        if(m2) { info.user_id = m2[1]; break; }
-    }
-
-    var text = document.body.innerText;
-    var fm = text.match(/(\\d+)\\s*follower/);
-    if(fm) info.followers = parseInt(fm[1]);
-    var fwm = text.match(/(\\d+)\\s*following/);
-    if(fwm) info.following = parseInt(fwm[1]);
-
-    return JSON.stringify(info);
-}
-""")
-            return json.loads(result)
-        except:
-            return None
-
-    def _api_followers(self, username):
-        try:
-            info = self._get_profile_info(username)
-            if not info or not info.get('user_id'):
-                return None
-            uid = info['user_id']
-            expected = info.get('followers', 0)
-            all_users = []
-            seen = set()
-            max_id = None
-            while True:
-                url = f'https://www.instagram.com/api/v1/friendships/{uid}/followers/?count=200'
-                if max_id:
-                    url += f'&max_id={max_id}'
-                js = f"""
-async () => {{
-    try {{
-        var r = await fetch('{url}', {{
-            credentials:'include',
-            headers:{{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'936619743392459','X-ASBD-ID':'359341'}}
-        }});
-        if(!r.ok) return JSON.stringify({{ok:false}});
-        var d = await r.json();
-        return JSON.stringify({{ok:true, users:(d.users||[]).map(function(u){{return u.username;}}), next_max_id:d.next_max_id||null}});
-    }} catch(e) {{ return JSON.stringify({{ok:false}}); }}
-}}
-"""
-                result = self.page.evaluate(js)
-                data = json.loads(result)
-                if not data.get("ok"):
-                    break
-                for u in data.get("users", []):
-                    if u not in seen:
-                        seen.add(u)
-                        all_users.append(u)
-                max_id = data.get("next_max_id")
-                if not max_id or (expected > 0 and len(all_users) >= expected):
-                    break
-                self.page.wait_for_timeout(500)
-            return all_users
-        except Exception as e:
-            print(f"  _api_followers error: {e}")
-        return None
-
-    def _api_following(self, username):
-        try:
-            info = self._get_profile_info(username)
-            if not info or not info.get('user_id'):
-                return None
-            uid = info['user_id']
-            expected = info.get('following', 0)
-            all_users = []
-            seen = set()
-            max_id = None
-            while True:
-                url = f'https://www.instagram.com/api/v1/friendships/{uid}/following/?count=200'
-                if max_id:
-                    url += f'&max_id={max_id}'
-                js = f"""
-async () => {{
-    try {{
-        var r = await fetch('{url}', {{
-            credentials:'include',
-            headers:{{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'936619743392459','X-ASBD-ID':'359341'}}
-        }});
-        if(!r.ok) return JSON.stringify({{ok:false}});
-        var d = await r.json();
-        return JSON.stringify({{ok:true, users:(d.users||[]).map(function(u){{return u.username;}}), next_max_id:d.next_max_id||null}});
-    }} catch(e) {{ return JSON.stringify({{ok:false}}); }}
-}}
-"""
-                result = self.page.evaluate(js)
-                data = json.loads(result)
-                if not data.get("ok"):
-                    break
-                for u in data.get("users", []):
-                    if u not in seen:
-                        seen.add(u)
-                        all_users.append(u)
-                max_id = data.get("next_max_id")
-                if not max_id or (expected > 0 and len(all_users) >= expected):
-                    break
-                self.page.wait_for_timeout(500)
-            return all_users
-        except Exception as e:
-            print(f"  _api_following error: {e}")
-        return None
-
-    def _click_text(self, text):
-        """Click an element by visible text content."""
-        try:
-            el = self.page.query_selector(f"text={text}")
-            if el:
-                el.click()
+            el = self.page.get_by_text(text, exact=True).first
+            if await el.is_visible(timeout=3000):
+                await el.click()
+                await asyncio.sleep(0.5)
                 return True
-        except: pass
+        except Exception:
+            pass
+
+        # Try contains-match via locator filter (handles "401 followers", "383 following")
+        try:
+            a = self.page.locator('a').filter(has_text=text).first
+            if await a.is_visible(timeout=3000):
+                await a.click()
+                await asyncio.sleep(0.5)
+                return True
+        except Exception:
+            pass
+
+        # Try href containing text
+        try:
+            a = self.page.locator(f'a[href*="{text.lower()}"]').first
+            if await a.is_visible(timeout=3000):
+                await a.click()
+                await asyncio.sleep(0.5)
+                return True
+        except Exception:
+            pass
         return False
 
-    def _scrape_modal(self):
-        """Scrape usernames from the open followers/following modal."""
+    async def _get_profile_info(self, username):
+        await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+        html = await self.page.evaluate("document.body.innerHTML")
+        info = {"user_id": None, "followers": None, "following": None}
+
+        m = re.search(r'"user_id":"(\d+)"', html)
+        if m: info["user_id"] = m.group(1)
+
+        m = re.search(r'"edge_followed_by"\s*:\s*{\s*"count"\s*:\s*(\d+)', html)
+        if m: info["followers"] = int(m.group(1))
+
+        m = re.search(r'"edge_follow"\s*:\s*{\s*"count"\s*:\s*(\d+)', html)
+        if m: info["following"] = int(m.group(1))
+
         try:
-            self.page.wait_for_timeout(2000)
-            users = []
-            seen = set()
-            last_h = 0
-            same_count = 0
-            stall_threshold = 15
+            js = """
+            var info = {};
+            var html = document.body.innerHTML;
+            var m = html.match(/["']user_id["'][:"]+\\s*(\\d{8,})/);
+            if(m) info.user_id = m[1];
+            m = html.match(/["']pk["'][:"]+\\s*(\\d{8,})/);
+            if(m) info.user_id = m[1];
+            var scripts = document.querySelectorAll('script');
+            for(var i = 0; i < scripts.length; i++) {
+                var t = scripts[i].textContent || '';
+                var m2 = t.match(/"user_id":"(\\d+)"/);
+                if(m2) { info.user_id = m2[1]; break; }
+            }
+            var sections = document.querySelectorAll('section ul li span span');
+            if(sections.length >= 2) {
+                info.followers = parseInt(sections[0].textContent.replace(/,/g,''));
+                info.following = parseInt(sections[1].textContent.replace(/,/g,''));
+            }
+            return JSON.stringify(Object.keys(info).length ? info : null);
+            """
+            extra = await self.page.evaluate(js)
+            if extra and extra != "null":
+                extra = json.loads(extra)
+                if extra.get("user_id") and not info["user_id"]: info["user_id"] = extra["user_id"]
+                if extra.get("followers") and not info["followers"]: info["followers"] = extra["followers"]
+                if extra.get("following") and not info["following"]: info["following"] = extra["following"]
+        except Exception:
+            pass
 
-            for _ in range(1000):
-                items = self.page.evaluate("""
-                    Array.from(document.querySelectorAll('[role=dialog] a'))
-                        .map(function(a) { return a.getAttribute('href'); })
-                        .filter(function(h) { return h && h[0] === '/' && h.lastIndexOf('/') > 0; })
-                        .map(function(h) { return h.replace(/^\\//, '').replace(/\\/$/, ''); })
-                """)
-                new_u = 0
-                for u in items:
-                    if u and u not in seen:
-                        seen.add(u)
-                        users.append(u)
-                        new_u += 1
+        if not info["user_id"]:
+            m = re.search(r'/(\d+)/', await self.page.evaluate("window.location.pathname"))
+            if m: info["user_id"] = m.group(1)
 
-                self.page.evaluate("""
-                    var d = document.querySelector('[role=dialog]');
-                    if(d) {
-                        var all = d.querySelectorAll('*');
-                        for(var i = 0; i < all.length; i++) {
-                            var cs = window.getComputedStyle(all[i]);
-                            if(cs.overflowY === 'scroll') {
-                                all[i].scroll(0, all[i].scrollTop + 400);
-                                break;
-                            }
-                        }
+        return info
+
+    async def _api_followers(self, username):
+        await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+        csrf = await self.page.evaluate('() => {var m = document.cookie.match(/csrftoken=([^;]+)/); return m ? m[1] : ""}')
+        if not csrf:
+            print("  API: No CSRF token")
+            return None
+
+        html = await self.page.evaluate("document.body.innerHTML")
+        m = re.search(r'"user_id":"(\d+)"', html)
+        if not m:
+            print("  API: Could not resolve user ID")
+            return None
+        uid = m.group(1)
+
+        all_users = []
+        seen = set()
+        max_id = None
+        page_count = 0
+
+        while True:
+            page_count += 1
+            params = f"page_size=50"
+            if max_id:
+                params += f"&max_id={max_id}"
+
+            try:
+                data = await self.page.evaluate(f"""async () => {{
+                    var r = await fetch('/api/v1/friendships/{uid}/mutual_followers/?{params}', {{
+                        headers: {{'X-CSRFToken': '{csrf}', 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest'}}
+                    }});
+                    return await r.json();
+                }}""")
+            except Exception as e:
+                print(f"  API followers page {page_count} error: {e}")
+                if page_count >= 5:
+                    return None
+                await asyncio.sleep(2)
+                continue
+
+            users = data.get("users", [])
+            new_count = 0
+            for u in users:
+                uname = u.get("username")
+                if uname and uname not in seen:
+                    seen.add(uname)
+                    all_users.append(uname)
+                    new_count += 1
+
+            if page_count <= 2:
+                print(f"  API followers page {page_count}: got {len(users)} entries ({new_count} new, total {len(all_users)})", end="")
+
+            max_id = data.get("next_max_id")
+
+            if not max_id:
+                if page_count <= 2:
+                    print(" — no more pages")
+                break
+            if len(users) < 50 and new_count == 0:
+                if page_count <= 2:
+                    print(" — last page")
+                break
+
+            await asyncio.sleep(0.5)
+
+        if page_count > 2:
+            print(f"  API followers done: {len(all_users)} unique users in {page_count} pages")
+        return all_users
+
+    async def _api_following(self, username):
+        await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+        csrf = await self.page.evaluate('() => {var m = document.cookie.match(/csrftoken=([^;]+)/); return m ? m[1] : ""}')
+        if not csrf:
+            print("  API: No CSRF token")
+            return None
+
+        html = await self.page.evaluate("document.body.innerHTML")
+        m = re.search(r'"user_id":"(\d+)"', html)
+        if not m:
+            print("  API: Could not resolve user ID")
+            return None
+        uid = m.group(1)
+
+        all_users = []
+        seen = set()
+        max_id = None
+        page_count = 0
+
+        while True:
+            page_count += 1
+            params = f"count=50"
+            if max_id:
+                params += f"&max_id={max_id}"
+
+            try:
+                data = await self.page.evaluate(f"""async () => {{
+                    var r = await fetch('/api/v1/friendships/{uid}/following/?{params}', {{
+                        headers: {{'X-CSRFToken': '{csrf}', 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest'}}
+                    }});
+                    return await r.json();
+                }}""")
+            except Exception as e:
+                print(f"  API following page {page_count} error: {e}")
+                if page_count >= 5:
+                    return None
+                await asyncio.sleep(2)
+                continue
+
+            users = data.get("users", [])
+            new_count = 0
+            for u in users:
+                uname = u.get("username")
+                if uname and uname not in seen:
+                    seen.add(uname)
+                    all_users.append(uname)
+                    new_count += 1
+
+            if page_count <= 2:
+                print(f"  API following page {page_count}: got {len(users)} entries ({new_count} new, total {len(all_users)})", end="")
+
+            max_id = data.get("next_max_id")
+
+            if not max_id:
+                if page_count <= 2:
+                    print(" — no more pages")
+                break
+            if len(users) < 50 and new_count == 0:
+                if page_count <= 2:
+                    print(" — last page")
+                break
+
+            await asyncio.sleep(0.5)
+
+        if page_count > 2:
+            print(f"  API following done: {len(all_users)} unique users in {page_count} pages")
+        return all_users
+
+    _EXCLUDE = {'explore', 'reels', 'accounts', 'direct', 'stories'}
+
+    async def _scrape_modal(self, max_items=200):
+        usernames = []
+        seen = set()
+        stall_count = 0
+
+        for it in range(1000):
+            entries = await self.page.evaluate("""() => {
+                var els = document.querySelectorAll('div[role="dialog"] a[role="link"]');
+                return Array.from(els).map(e => e.getAttribute('href').replace(/^\\//,'').replace(/\\/.*$/,'')).filter(Boolean);
+            }""")
+            new = 0
+            for u in entries:
+                if u not in seen and u not in self._EXCLUDE:
+                    seen.add(u)
+                    usernames.append(u)
+                    new += 1
+            if new > 0:
+                stall_count = 0
+            else:
+                stall_count += 1
+
+            if stall_count >= 15:
+                break
+            if len(usernames) >= max_items:
+                break
+
+            # Check if this dialog shows "Suggested for you" (not real followers)
+            has_suggestions = await self.page.evaluate("""() => {
+                var d = document.querySelector('div[role="dialog"]');
+                return d ? d.textContent.includes('Suggested for you') : false;
+            }""")
+            if has_suggestions and len(usernames) > 0:
+                break
+
+            await self.page.evaluate("""() => {
+                var d = document.querySelector('div[role="dialog"]');
+                if(!d) return;
+                var all = d.querySelectorAll('div');
+                for(var el of all) {
+                    var cs = window.getComputedStyle(el);
+                    if((cs.overflowY === 'scroll' || cs.overflowY === 'auto') && el.scrollHeight > el.clientHeight) {
+                        el.scrollTop += el.clientHeight * 0.85;
+                        el.dispatchEvent(new Event('scroll', {bubbles: true}));
                     }
-                """)
+                }
+            }""")
+            await asyncio.sleep(0.7)
 
-                cur_h = self.page.evaluate("""
-                    (function() {
-                        var d = document.querySelector('[role=dialog]');
-                        if(!d) return 0;
-                        var all = d.querySelectorAll('*');
-                        for(var i = 0; i < all.length; i++) {
-                            var cs = window.getComputedStyle(all[i]);
-                            if(cs.overflowY === 'scroll') return all[i].scrollHeight;
-                        }
-                        return 0;
-                    })()
-                """)
+        return usernames
 
-                if cur_h == last_h:
-                    same_count += 1
-                else:
-                    same_count = 0
-                    last_h = cur_h
-
-                if same_count >= stall_threshold and new_u == 0:
-                    break
-
-                self.page.wait_for_timeout(600) if cur_h == last_h else self.page.wait_for_timeout(400)
-
-            return users
-        except Exception as e:
-            print(f"  _scrape_modal error: {e}")
-        return None
-
-    def _page_followers(self, username):
-        """Fallback: scrape followers from DOM modal."""
+    async def _page_followers(self, username):
         try:
-            self._goto_with_retry(f"https://www.instagram.com/{username}/")
-            self.page.wait_for_timeout(3000)
-            if not self._click_text("followers"):
+            await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+            await self.page.wait_for_timeout(3000)
+            if not await self._click_text("followers"):
                 print("  _page_followers: cannot find followers text")
                 return None
-            result = self._scrape_modal()
+            result = await self._scrape_modal(max_items=100)
             if result is None:
                 print("  _page_followers: _scrape_modal returned None")
             return result
@@ -331,15 +372,14 @@ async () => {{
             print(f"  _page_followers error: {e}")
         return None
 
-    def _page_following(self, username):
-        """Fallback: scrape following from DOM modal."""
+    async def _page_following(self, username):
         try:
-            self._goto_with_retry(f"https://www.instagram.com/{username}/")
-            self.page.wait_for_timeout(3000)
-            if not self._click_text("following"):
+            await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+            await self.page.wait_for_timeout(3000)
+            if not await self._click_text("following"):
                 print("  _page_following: cannot find following text")
                 return None
-            result = self._scrape_modal()
+            result = await self._scrape_modal(max_items=500)
             if result is None:
                 print("  _page_following: _scrape_modal returned None")
             return result
@@ -347,8 +387,40 @@ async () => {{
             print(f"  _page_following error: {e}")
         return None
 
-    def close(self):
-        try: self.browser.close()
-        except: pass
-        try: self.pw.stop()
-        except: pass
+    async def get_followers(self, username):
+        return await self._page_followers(username)
+
+    async def get_following(self, username):
+        return await self._page_following(username)
+
+    async def get_profile_pic(self, username):
+        if "instagram.com" not in self.page.url:
+            try:
+                await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
+                await self.page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+        url_data = await self.page.evaluate(f"""async () => {{
+            try {{
+                var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
+                if(!csrf) return null;
+                var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
+                    headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
+                }});
+                if(!r.ok) return null;
+                var data = await r.json();
+                if(data && data.data && data.data.user) {{
+                    var u = data.data.user;
+                    return u.hd_profile_pic_url_info ? u.hd_profile_pic_url_info.url : u.profile_pic_url;
+                }}
+                return null;
+            }} catch(e) {{ return null; }}
+        }}""")
+        if not url_data:
+            return None, None
+
+        resp = await self.page.request.get(url_data)
+        if resp.ok:
+            return url_data, await resp.body()
+        return url_data, None
