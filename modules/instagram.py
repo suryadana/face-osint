@@ -1,8 +1,14 @@
 """
 Instagram scraper — Playwright Async API
 """
-import json, re, random, asyncio
+import json, re, asyncio
 from playwright.async_api import async_playwright
+
+from modules import config
+from modules.ratelimit import (
+    RateLimiter, RequestBudget, backoff_delay,
+    detect_soft_block, SoftBlockError, jittered_delay,
+)
 
 # Shared browser — one Playwright instance across all Instagram objects
 _pw = None
@@ -43,15 +49,18 @@ def parse_cookies(s):
     return c
 
 async def _backoff_wait(attempt):
-    delay = min(2 ** attempt + random.uniform(0, 1), 30)
-    print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})")
+    delay = backoff_delay(attempt, cap=config.BACKOFF_CAP)
+    print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})", flush=True)
     await asyncio.sleep(delay)
 
 class Instagram:
-    def __init__(self, cookie_string, timeout=15000, skip_home=False):
+    def __init__(self, cookie_string, timeout=15000, skip_home=False,
+                 rate_limiter=None, budget=None):
         self.cookie_string = cookie_string
         self.timeout = timeout
         self.skip_home = skip_home
+        self.rate_limiter = rate_limiter or RateLimiter(0)
+        self.budget = budget or RequestBudget(None)
         self.ctx = None
         self.page = None
 
@@ -76,12 +85,20 @@ class Instagram:
 
     async def _goto_with_retry(self, url, wait_until="domcontentloaded"):
         for attempt in range(5):
+            await self.rate_limiter.acquire()
+            await self.budget.spend()
             try:
                 r = await self.page.goto(url, wait_until=wait_until, timeout=self.timeout)
+                final_url = self.page.url
+                kind = detect_soft_block(r.status if r else 200, final_url, "")
+                if kind:
+                    raise SoftBlockError(kind, url)
                 if r and r.status == 429:
                     await _backoff_wait(attempt)
                 else:
                     return r
+            except SoftBlockError:
+                raise
             except Exception:
                 if attempt == 4:
                     raise
@@ -231,7 +248,7 @@ class Instagram:
                     print(" — last page")
                 break
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(jittered_delay(0.5, 1.5))
 
         if page_count > 2:
             print(f"  API followers done: {len(all_users)} unique users in {page_count} pages")
@@ -299,7 +316,7 @@ class Instagram:
                     print(" — last page")
                 break
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(jittered_delay(0.5, 1.5))
 
         if page_count > 2:
             print(f"  API following done: {len(all_users)} unique users in {page_count} pages")
@@ -353,7 +370,7 @@ class Instagram:
                     }
                 }
             }""")
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(jittered_delay(0.7, 1.8))
 
         return usernames
 
@@ -395,12 +412,11 @@ class Instagram:
 
     async def get_profile_pic(self, username):
         if "instagram.com" not in self.page.url:
-            try:
-                await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
-                await self.page.wait_for_timeout(2000)
-            except Exception:
-                pass
+            await self._goto_with_retry("https://www.instagram.com/")
+            await self.page.wait_for_timeout(2000)
 
+        await self.rate_limiter.acquire()
+        await self.budget.spend()
         url_data = await self.page.evaluate(f"""async () => {{
             try {{
                 var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
@@ -421,6 +437,9 @@ class Instagram:
             return None, None
 
         resp = await self.page.request.get(url_data)
+        kind = detect_soft_block(resp.status, url_data, "")
+        if kind:
+            raise SoftBlockError(kind, "profile_pic")
         if resp.ok:
             return url_data, await resp.body()
         return url_data, None
