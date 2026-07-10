@@ -17,6 +17,14 @@ def cap_expansions(candidates, max_per_layer):
     return list(candidates)[:max_per_layer]
 
 
+def decide_account(image_scores, threshold, consensus_min):
+    """Aggregate per-image scores: max for ranking, consensus (>=consensus_min hits) for match."""
+    valid = [s for s in image_scores if s is not None]
+    score = max(valid) if valid else None
+    matched = sum(1 for s in valid if s >= threshold)
+    return {"score": score, "matched": matched, "is_match": matched >= consensus_min}
+
+
 class BFSSearch:
     def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None,
                  rate_limiter=None, budget=None):
