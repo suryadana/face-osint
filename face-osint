@@ -8,6 +8,7 @@ Commands:
     --depth N    Graph depth (1=direct, 2=friends-of-friends, 3=...)
     --workers N  Parallel checks (default 3)
     --threshold X  Match threshold 0-1 (default 0.35)
+    --posts N       Recent posts sampled per account (default 3; 0=profile pic only)
     --rate N        Global read pace, requests/min (default 20; 0=off)
     --max-requests N  Per-run request budget (default 800)
     --max-expand N  Max accounts expanded per layer (default 15)
@@ -157,6 +158,7 @@ async def cmd_search(args):
         print("  --workers N   Parallel workers (default 3)")
         print("  --threshold X Match threshold 0-1 (default 0.35)")
         print("  --no-cache    Re-scrape followers/following, ignore saved cache")
+        print("  --posts N     Recent posts sampled per account (default 3; 0=profile pic only)")
         print("  --rate N        Global read pace, requests/min (default 20; 0=off)")
         print("  --max-requests N  Per-run request budget (default 800)")
         print("  --max-expand N  Max accounts expanded per layer (default 15)")
@@ -174,6 +176,7 @@ async def cmd_search(args):
     threshold = config.SIM_THRESHOLD
     depth = 1
     no_cache = False
+    post_n = config.POST_SAMPLE_N
     rate = config.RATE_PER_MIN
     max_requests = config.MAX_REQUESTS
     max_expand = config.MAX_EXPANSIONS_PER_LAYER
@@ -189,6 +192,8 @@ async def cmd_search(args):
             depth = int(args[i + 1]); i += 2
         elif args[i] == "--no-cache":
             no_cache = True; i += 1
+        elif args[i] == "--posts" and i + 1 < len(args):
+            post_n = int(args[i + 1]); i += 2
         elif args[i] == "--rate" and i + 1 < len(args):
             rate = int(args[i + 1]); i += 2
         elif args[i] == "--max-requests" and i + 1 < len(args):
@@ -248,7 +253,7 @@ async def cmd_search(args):
 
     searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers,
                          face_engine=engine, ref_emb=ref_emb,
-                         rate_limiter=limiter, budget=budget)
+                         rate_limiter=limiter, budget=budget, post_n=post_n)
     t0 = time.time()
     results = await searcher.search(layer0, depth=depth)
     elapsed = time.time() - t0

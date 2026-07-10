@@ -20,7 +20,7 @@ Project ini memang sudah memakai Playwright (browser asli). Itu menyelesaikan **
 
 ## Model volume request
 
-Per akun yang **dicek**: konteks browser baru + navigasi ke `/` + XHR `web_profile_info` + fetch gambar ≈ **3 request/akun**. Per akun yang **di-expand**: ~2 navigasi + puluhan XHR list.
+Per akun yang **dicek**: konteks browser baru + navigasi ke `/` + XHR `web_profile_info` + fetch gambar ≈ **3 request/akun** untuk foto profil saja. Dengan agregasi profil+post (`--posts N`, default 3), tiap akun yang dicek bisa menambah **1..N fetch gambar post** di atas base 3 request — jadi biaya per-akun naik menjadi **~3 + (1..N) request**, tergantung berapa post yang benar-benar diunduh sebelum konsensus (`config.CONSENSUS_MIN`) tercapai atau `post_urls` habis. Sampling **berhenti lebih awal** begitu konsensus match tercapai (tidak selalu mengunduh semua N post), dan seluruh fetch gambar post tetap lewat `download_image` yang dipacing oleh `rate_limiter`/`budget` yang sama seperti request lain — jadi volume tambahan ini tetap dibatasi oleh `--rate`/`--max-requests`, bukan unbounded. Per akun yang **di-expand**: ~2 navigasi + puluhan XHR list.
 
 Dengan followers cap 100, following cap 500, workers 3:
 

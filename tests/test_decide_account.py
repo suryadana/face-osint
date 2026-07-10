@@ -18,3 +18,8 @@ def test_single_hit_is_not_match_under_consensus():
 def test_all_none_gives_none_score():
     r = decide_account([None, None], threshold=0.35, consensus_min=2)
     assert r == {"score": None, "matched": 0, "is_match": False}
+
+
+def test_boundary_score_equals_threshold_is_match():
+    r = decide_account([0.35], threshold=0.35, consensus_min=1)
+    assert r["is_match"] is True
