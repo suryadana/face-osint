@@ -17,12 +17,21 @@ def cap_expansions(candidates, max_per_layer):
     return list(candidates)[:max_per_layer]
 
 
+def decide_account(image_scores, threshold, consensus_min):
+    """Aggregate per-image scores: max for ranking, consensus (>=consensus_min hits) for match."""
+    valid = [s for s in image_scores if s is not None]
+    score = max(valid) if valid else None
+    matched = sum(1 for s in valid if s >= threshold)
+    return {"score": score, "matched": matched, "is_match": matched >= consensus_min}
+
+
 class BFSSearch:
     def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None,
-                 rate_limiter=None, budget=None):
+                 rate_limiter=None, budget=None, post_n=None):
         self.ref_path = ref_image_path
         self.cookie = cookie_string or config.COOKIE_STRING
         self.workers = workers or config.WORKERS
+        self.post_n = config.POST_SAMPLE_N if post_n is None else post_n
         if face_engine:
             self.face = face_engine
             self.ref_emb = ref_emb
@@ -53,22 +62,41 @@ class BFSSearch:
         try:
             async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True,
                                   rate_limiter=self.rate_limiter, budget=self.budget) as ig:
-                url, pic = await ig.get_profile_pic(username)
-                if not pic: return None
-
+                media = await ig.get_profile_media(username)
+                pic_url = media["profile_pic_url"]
+                if not pic_url:
+                    return None
                 async with self.lock:
-                    if url in self.checked_urls: return None
-                    self.checked_urls.add(url)
+                    if pic_url in self.checked_urls:
+                        return None
+                    self.checked_urls.add(pic_url)
 
-                sim = self.face.compare_to_ref(pic, self.ref_emb)
-                if sim is not None:
+                # Cap consensus to the max images actually available for this account,
+                # so --posts 0 (profile pic only) preserves old single-hit match behavior.
+                effective_consensus = min(config.CONSENSUS_MIN, 1 + self.post_n)
+
+                scores = []
+                pic = await ig.download_image(pic_url)
+                if pic is not None:
+                    scores.append(self.face.max_similarity_to_ref(pic, self.ref_emb))
+
+                for post_url in media["post_urls"][: self.post_n]:
+                    d = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
+                    if d["is_match"]:
+                        break                       # early-stop: consensus already reached
+                    img = await ig.download_image(post_url)
+                    if img is not None:
+                        scores.append(self.face.max_similarity_to_ref(img, self.ref_emb))
+
+                decision = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
+                if decision["score"] is not None:
                     async with self.lock:
-                        self.results.append((username, sim))
+                        self.results.append((username, decision["score"]))
                         self.total_face_checks += 1
-                    if sim >= config.SIM_THRESHOLD:
+                    if decision["is_match"]:
                         self.found.set()
-                        self.found_data[0] = (username, sim)
-                        return (username, sim)
+                        self.found_data[0] = (username, decision["score"])
+                        return (username, decision["score"])
         except (SoftBlockError, BudgetExceeded) as e:
             self.stop_reason = str(e)
             self.stopped.set()

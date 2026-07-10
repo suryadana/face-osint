@@ -10,6 +10,19 @@ from modules.ratelimit import (
     detect_soft_block, SoftBlockError, jittered_delay,
 )
 
+def parse_profile_media(api_json):
+    """Extract profile pic URL + recent post image URLs from a web_profile_info response."""
+    user = ((api_json or {}).get("data") or {}).get("user") or {}
+    pic = (user.get("hd_profile_pic_url_info") or {}).get("url") or user.get("profile_pic_url")
+    edges = (user.get("edge_owner_to_timeline_media") or {}).get("edges") or []
+    posts = []
+    for e in edges:
+        node = e.get("node") or {}
+        u = node.get("display_url") or node.get("thumbnail_src")
+        if u:
+            posts.append(u)
+    return {"profile_pic_url": pic, "post_urls": posts}
+
 # Shared browser — one Playwright instance across all Instagram objects
 _pw = None
 _browser = None
@@ -443,3 +456,41 @@ class Instagram:
         if resp.ok:
             return url_data, await resp.body()
         return url_data, None
+
+    async def get_profile_media(self, username):
+        if "instagram.com" not in self.page.url:
+            await self._goto_with_retry("https://www.instagram.com/")
+            await self.page.wait_for_timeout(2000)
+
+        await self.rate_limiter.acquire()
+        await self.budget.spend()
+        raw = await self.page.evaluate(f"""async () => {{
+            try {{
+                var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
+                if(!csrf) return null;
+                var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
+                    headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
+                }});
+                if(!r.ok){{ var t=""; try{{ t=await r.text(); }}catch(e){{}}; return {{__nonok:true, __status:r.status, __url:r.url, __body:(t||"").slice(0,500)}}; }}
+                return await r.json();
+            }} catch(e) {{ return null; }}
+        }}""")
+        if raw and raw.get("__nonok"):
+            kind = detect_soft_block(raw.get("__status", 0), raw.get("__url", ""), raw.get("__body", ""))
+            if kind:
+                raise SoftBlockError(kind, "profile_media")
+            return {"profile_pic_url": None, "post_urls": []}   # genuine non-2xx (e.g. 404), not a soft-block
+        if not raw:
+            return {"profile_pic_url": None, "post_urls": []}
+        return parse_profile_media(raw)
+
+    async def download_image(self, url):
+        if not url:
+            return None
+        await self.rate_limiter.acquire()
+        await self.budget.spend()
+        resp = await self.page.request.get(url)
+        kind = detect_soft_block(resp.status, url, "")
+        if kind:
+            raise SoftBlockError(kind, "post_image")
+        return await resp.body() if resp.ok else None

@@ -1,0 +1,275 @@
+# Review package: c8ffbae..3dc3701
+
+## Commits
+3dc3701 feat(search): add decide_account aggregation (max rank + consensus stop)
+459ac15 feat(instagram): parse profile+post media, add paced download_image (Playwright)
+ab5b683 feat(face): add max_similarity + multi-face embedding extraction
+
+## Files changed
+ modules/face.py              | 20 ++++++++++++++++++++
+ modules/instagram.py         | 43 +++++++++++++++++++++++++++++++++++++++++++
+ modules/search.py            |  8 ++++++++
+ tests/test_decide_account.py | 20 ++++++++++++++++++++
+ tests/test_face_agg.py       | 16 ++++++++++++++++
+ tests/test_profile_media.py  | 30 ++++++++++++++++++++++++++++++
+ 6 files changed, 137 insertions(+)
+
+## Diff
+diff --git a/modules/face.py b/modules/face.py
+index baff121..08376f9 100644
+--- a/modules/face.py
++++ b/modules/face.py
+@@ -1,16 +1,25 @@
+ """
+ Face comparison engine — insightface buffalo_l
+ """
+ import cv2, insightface, numpy as np
+ from numpy.linalg import norm
+ 
++def max_similarity(embeddings, ref_emb):
++    """Max cosine similarity between ref_emb and any embedding in the list. None if empty."""
++    best = None
++    for emb in embeddings:
++        sim = float(ref_emb @ emb / (norm(ref_emb) * norm(emb)))
++        if best is None or sim > best:
++            best = sim
++    return best
++
+ class FaceEngine:
+     def __init__(self, model_name="buffalo_l"):
+         self.model = insightface.app.FaceAnalysis(name=model_name)
+         self.model.prepare(ctx_id=0)
+ 
+     def get_embedding(self, img_data):
+         """Extract face embedding from raw image bytes. Returns embedding or None."""
+         img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+         if img is None: return None
+         faces = self.model.get(img)
+@@ -18,20 +27,31 @@ class FaceEngine:
+         return faces[0].embedding
+ 
+     def get_embedding_from_path(self, path):
+         """Extract face embedding from image file path."""
+         img = cv2.imread(path)
+         if img is None: return None
+         faces = self.model.get(img)
+         if len(faces) == 0: return None
+         return faces[0].embedding
+ 
++    def all_embeddings(self, img_data):
++        """All face embeddings from raw image bytes (empty list if none)."""
++        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
++        if img is None:
++            return []
++        return [f.embedding for f in self.model.get(img)]
++
++    def max_similarity_to_ref(self, img_data, ref_emb):
++        """Max similarity of ref_emb to any face found in the image bytes."""
++        return max_similarity(self.all_embeddings(img_data), ref_emb)
++
+     def compare(self, emb1, emb2):
+         """Cosine similarity between two embeddings. Returns float 0-1."""
+         return float(emb1 @ emb2 / (norm(emb1) * norm(emb2)))
+ 
+     def compare_images(self, img_data1, img_data2):
+         """Compare two face images (raw bytes). Returns (sim, emb1, emb2) or (None, None, None)."""
+         emb1 = self.get_embedding(img_data1)
+         emb2 = self.get_embedding(img_data2)
+         if emb1 is None or emb2 is None: return None, None, None
+         return self.compare(emb1, emb2), emb1, emb2
+diff --git a/modules/instagram.py b/modules/instagram.py
+index 2b23162..01b2fca 100644
+--- a/modules/instagram.py
++++ b/modules/instagram.py
+@@ -3,20 +3,33 @@ Instagram scraper — Playwright Async API
+ """
+ import json, re, asyncio
+ from playwright.async_api import async_playwright
+ 
+ from modules import config
+ from modules.ratelimit import (
+     RateLimiter, RequestBudget, backoff_delay,
+     detect_soft_block, SoftBlockError, jittered_delay,
+ )
+ 
++def parse_profile_media(api_json):
++    """Extract profile pic URL + recent post image URLs from a web_profile_info response."""
++    user = ((api_json or {}).get("data") or {}).get("user") or {}
++    pic = (user.get("hd_profile_pic_url_info") or {}).get("url") or user.get("profile_pic_url")
++    edges = (user.get("edge_owner_to_timeline_media") or {}).get("edges") or []
++    posts = []
++    for e in edges:
++        node = e.get("node") or {}
++        u = node.get("display_url") or node.get("thumbnail_src")
++        if u:
++            posts.append(u)
++    return {"profile_pic_url": pic, "post_urls": posts}
++
+ # Shared browser — one Playwright instance across all Instagram objects
+ _pw = None
+ _browser = None
+ _browser_lock = asyncio.Lock()
+ _owns_browser = False
+ 
+ async def ensure_browser(headless=True):
+     global _pw, _browser
+     if _pw is None:
+         async with _browser_lock:
+@@ -436,10 +449,40 @@ class Instagram:
+         if not url_data:
+             return None, None
+ 
+         resp = await self.page.request.get(url_data)
+         kind = detect_soft_block(resp.status, url_data, "")
+         if kind:
+             raise SoftBlockError(kind, "profile_pic")
+         if resp.ok:
+             return url_data, await resp.body()
+         return url_data, None
++
++    async def get_profile_media(self, username):
++        if "instagram.com" not in self.page.url:
++            try:
++                await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
++                await self.page.wait_for_timeout(2000)
++            except Exception:
++                pass
++        raw = await self.page.evaluate(f"""async () => {{
++            try {{
++                var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
++                if(!csrf) return null;
++                var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
++                    headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
++                }});
++                if(!r.ok) return null;
++                return await r.json();
++            }} catch(e) {{ return null; }}
++        }}""")
++        if not raw:
++            return {"profile_pic_url": None, "post_urls": []}
++        return parse_profile_media(raw)
++
++    async def download_image(self, url):
++        if not url:
++            return None
++        await self.rate_limiter.acquire()
++        await self.budget.spend()
++        resp = await self.page.request.get(url)
++        return await resp.body() if resp.ok else None
+diff --git a/modules/search.py b/modules/search.py
+index ced7454..d93778d 100644
+--- a/modules/search.py
++++ b/modules/search.py
+@@ -10,20 +10,28 @@ from modules.face import FaceEngine
+ from modules.ratelimit import SoftBlockError, BudgetExceeded
+ 
+ 
+ def cap_expansions(candidates, max_per_layer):
+     """Return at most max_per_layer candidates (None => no cap)."""
+     if max_per_layer is None:
+         return list(candidates)
+     return list(candidates)[:max_per_layer]
+ 
+ 
++def decide_account(image_scores, threshold, consensus_min):
++    """Aggregate per-image scores: max for ranking, consensus (>=consensus_min hits) for match."""
++    valid = [s for s in image_scores if s is not None]
++    score = max(valid) if valid else None
++    matched = sum(1 for s in valid if s >= threshold)
++    return {"score": score, "matched": matched, "is_match": matched >= consensus_min}
++
++
+ class BFSSearch:
+     def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None,
+                  rate_limiter=None, budget=None):
+         self.ref_path = ref_image_path
+         self.cookie = cookie_string or config.COOKIE_STRING
+         self.workers = workers or config.WORKERS
+         if face_engine:
+             self.face = face_engine
+             self.ref_emb = ref_emb
+         else:
+diff --git a/tests/test_decide_account.py b/tests/test_decide_account.py
+new file mode 100644
+index 0000000..cb0a2c9
+--- /dev/null
++++ b/tests/test_decide_account.py
+@@ -0,0 +1,20 @@
++from modules.search import decide_account
++
++
++def test_ranking_max_and_consensus_match():
++    r = decide_account([0.40, None, 0.38, 0.10], threshold=0.35, consensus_min=2)
++    assert abs(r["score"] - 0.40) < 1e-9
++    assert r["matched"] == 2
++    assert r["is_match"] is True
++
++
++def test_single_hit_is_not_match_under_consensus():
++    r = decide_account([0.50, 0.10, None], threshold=0.35, consensus_min=2)
++    assert abs(r["score"] - 0.50) < 1e-9
++    assert r["matched"] == 1
++    assert r["is_match"] is False
++
++
++def test_all_none_gives_none_score():
++    r = decide_account([None, None], threshold=0.35, consensus_min=2)
++    assert r == {"score": None, "matched": 0, "is_match": False}
+diff --git a/tests/test_face_agg.py b/tests/test_face_agg.py
+new file mode 100644
+index 0000000..a6abcd4
+--- /dev/null
++++ b/tests/test_face_agg.py
+@@ -0,0 +1,16 @@
++import numpy as np
++from modules.face import max_similarity
++
++
++def test_max_similarity_picks_best():
++    ref = np.array([1.0, 0.0, 0.0])
++    embs = [
++        np.array([0.0, 1.0, 0.0]),   # cos 0.0
++        np.array([1.0, 1.0, 0.0]),   # cos ~0.707
++        np.array([2.0, 0.0, 0.0]),   # cos 1.0
++    ]
++    assert abs(max_similarity(embs, ref) - 1.0) < 1e-6
++
++
++def test_max_similarity_empty_is_none():
++    assert max_similarity([], np.array([1.0, 0.0])) is None
+diff --git a/tests/test_profile_media.py b/tests/test_profile_media.py
+new file mode 100644
+index 0000000..6328cb6
+--- /dev/null
++++ b/tests/test_profile_media.py
+@@ -0,0 +1,30 @@
++from modules.instagram import parse_profile_media
++
++
++def _api(user):
++    return {"data": {"user": user}}
++
++
++def test_parse_extracts_pic_and_posts():
++    user = {
++        "hd_profile_pic_url_info": {"url": "https://cdn/hd.jpg"},
++        "profile_pic_url": "https://cdn/lo.jpg",
++        "edge_owner_to_timeline_media": {"edges": [
++            {"node": {"display_url": "https://cdn/p1.jpg"}},
++            {"node": {"display_url": "https://cdn/p2.jpg"}},
++        ]},
++    }
++    out = parse_profile_media(_api(user))
++    assert out["profile_pic_url"] == "https://cdn/hd.jpg"      # hd preferred
++    assert out["post_urls"] == ["https://cdn/p1.jpg", "https://cdn/p2.jpg"]
++
++
++def test_parse_falls_back_to_lo_pic_and_empty_posts():
++    out = parse_profile_media(_api({"profile_pic_url": "https://cdn/lo.jpg"}))
++    assert out["profile_pic_url"] == "https://cdn/lo.jpg"
++    assert out["post_urls"] == []
++
++
++def test_parse_handles_missing_user():
++    out = parse_profile_media({"data": {}})
++    assert out == {"profile_pic_url": None, "post_urls": []}

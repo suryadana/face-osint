@@ -1,86 +1,109 @@
-### Task 4: `detect_soft_block` + `SoftBlockError`
+### Task 4: Wire into `_check_one` + config + CLI + docs
 
 **Files:**
-- Modify: `modules/ratelimit.py`
-- Test: `tests/test_ratelimit.py`
+- Modify: `modules/config.py`, `modules/search.py` (`_check_one` `:33-59`, `__init__` `:12-31`), `face-osint` (`cmd_search`)
+- Modify: `docs/keamanan-dan-rate-limit.md`, `docs/penggunaan.md`
 
 **Interfaces:**
-- Produces:
-  - `class SoftBlockError(Exception)` with attr `.kind`.
-  - `detect_soft_block(status: int, url: str, body_text: str) -> str | None` — returns a kind string (`'login_redirect'`, `'checkpoint'`, `'challenge'`, `'feedback_required'`) or `None`. NOTE: HTTP 429 is a *throttle* (handled by backoff), NOT a soft-block, so it returns `None`.
+- Consumes: `get_profile_media`, `download_image`, `FaceEngine.max_similarity_to_ref`, `decide_account`, `config.POST_SAMPLE_N`, `config.CONSENSUS_MIN`, `config.SIM_THRESHOLD`.
 
-- [ ] **Step 1: Write failing test**
+- [ ] **Step 1: Add config knobs**
 
-Append to `tests/test_ratelimit.py`:
+In `modules/config.py`, after existing constants:
 ```python
-from modules.ratelimit import detect_soft_block, SoftBlockError
-
-
-def test_detect_login_redirect():
-    assert detect_soft_block(200, "https://www.instagram.com/accounts/login/?next=/x/", "") == "login_redirect"
-
-
-def test_detect_body_markers():
-    assert detect_soft_block(400, "https://www.instagram.com/x/", '{"message":"checkpoint_required"}') == "checkpoint"
-    assert detect_soft_block(400, "u", '{"message":"challenge_required"}') == "challenge"
-    assert detect_soft_block(400, "u", '{"message":"feedback_required"}') == "feedback_required"
-
-
-def test_429_is_not_soft_block():
-    assert detect_soft_block(429, "https://www.instagram.com/x/", "rate limited") is None
-
-
-def test_clean_response_is_none():
-    assert detect_soft_block(200, "https://www.instagram.com/x/", '{"data":{"user":{}}}') is None
+# --- Post-image aggregation ---
+POST_SAMPLE_N = 3      # recent posts sampled per checked account (0 = profile pic only)
+CONSENSUS_MIN = 2      # distinct images >= SIM_THRESHOLD required to auto-stop (FOUND)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Add `post_n` to BFSSearch + rewrite `_check_one` face logic**
 
-Run: `pytest tests/test_ratelimit.py -k "soft or detect or 429 or clean" -v`
-Expected: FAIL — `ImportError: cannot import name 'detect_soft_block'`.
-
-- [ ] **Step 3: Implement**
-
-Append to `modules/ratelimit.py`:
+In `BFSSearch.__init__`, add param `post_n=None` and store `self.post_n = config.POST_SAMPLE_N if post_n is None else post_n`.
+Replace the face-check core of `_check_one` (`:41-56`) with media aggregation:
 ```python
-class SoftBlockError(Exception):
-    def __init__(self, kind, detail=""):
-        self.kind = kind
-        super().__init__(("soft-block: %s %s" % (kind, detail)).strip())
+                media = await ig.get_profile_media(username)
+                pic_url = media["profile_pic_url"]
+                if not pic_url:
+                    return None
+                async with self.lock:
+                    if pic_url in self.checked_urls:
+                        return None
+                    self.checked_urls.add(pic_url)
 
+                scores = []
+                pic = await ig.download_image(pic_url)
+                if pic is not None:
+                    scores.append(self.face.max_similarity_to_ref(pic, self.ref_emb))
 
-_BODY_MARKERS = [
-    ("checkpoint", "checkpoint_required"),
-    ("challenge", "challenge_required"),
-    ("feedback_required", "feedback_required"),
-]
+                for post_url in media["post_urls"][: self.post_n]:
+                    d = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)
+                    if d["is_match"]:
+                        break                       # early-stop: consensus already reached
+                    img = await ig.download_image(post_url)
+                    if img is not None:
+                        scores.append(self.face.max_similarity_to_ref(img, self.ref_emb))
 
+                decision = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)
+                if decision["score"] is not None:
+                    async with self.lock:
+                        self.results.append((username, decision["score"]))
+                        self.total_face_checks += 1
+                    if decision["is_match"]:
+                        self.found.set()
+                        self.found_data[0] = (username, decision["score"])
+                        return (username, decision["score"])
+```
+Ensure `decide_account` is imported/defined in the module (Task 3) and `config` is in scope (already imported).
 
-def detect_soft_block(status, url, body_text):
-    """Detect account-level soft blocks. 429 (throttle) is intentionally NOT one."""
-    if status == 429:
-        return None
-    if url and "/accounts/login" in url:
-        return "login_redirect"
-    if body_text:
-        low = body_text.lower()
-        for kind, marker in _BODY_MARKERS:
-            if marker in low:
-                return kind
-    return None
+- [ ] **Step 3: CLI flag `--posts`**
+
+In `face-osint` `cmd_search`: add default `post_n = config.POST_SAMPLE_N` near other defaults; in the arg loop add:
+```python
+        elif args[i] == "--posts" and i + 1 < len(args):
+            post_n = int(args[i + 1]); i += 2
+```
+Pass `post_n=post_n` into the `BFSSearch(...)` constructor. Add a help line:
+```python
+        print("  --posts N     Recent posts sampled per account (default 3; 0=profile pic only)")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Manual verification (real run, low volume)**
 
-Run: `pytest tests/test_ratelimit.py -k "soft or detect or 429 or clean" -v`
-Expected: PASS (5 passed).
+Run:
+```bash
+./face-osint --cookie "sessionid=..." search ref.jpg <username> --depth 1 --posts 3 --max-requests 80
+```
+Expected: per account, downloads profile pic then up to 3 posts (visible), stops sampling an account early once 2 images match, ranks by best score. Compare `--posts 0` (old behavior) vs `--posts 3` on a known account whose profile pic is a logo — the post version should surface a score where the old one detected no face.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Update docs**
+
+- `docs/penggunaan.md`: add `--posts N` row to the `search` options table; note aggregation (max rank + consensus stop).
+- `docs/keamanan-dan-rate-limit.md`: update the volume model — per checked account cost rises from ~3 requests to ~3 + (1..N) image downloads; note this is bounded by the limiter/budget and the consensus early-stop.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add modules/ratelimit.py tests/test_ratelimit.py
-git commit -m "feat(ratelimit): add soft-block detection + SoftBlockError"
+git add modules/config.py modules/search.py face-osint docs/penggunaan.md docs/keamanan-dan-rate-limit.md
+git commit -m "feat: aggregate profile+post faces in search + --posts flag + docs"
 ```
 
 ---
 
+## Self-Review
+
+**Spec coverage:**
+- Robust aggregation (profile+posts) → Task 1 (`max_similarity`, multi-face) + Task 4 (wiring). ✓
+- Hybrid sampling N + early-stop → Task 4 (`media["post_urls"][:post_n]`, break on consensus). ✓
+- Per-image max across faces → Task 1 (`max_similarity_to_ref`). ✓
+- Ranking=max, auto-stop=consensus → Task 3 (`decide_account`). ✓
+- Free post URLs from web_profile_info → Task 2 (`get_profile_media` reuses the same fetch). ✓
+- Downloads via limiter/budget → Task 2 (`download_image` calls acquire/spend). ✓
+- Config `POST_SAMPLE_N`/`CONSENSUS_MIN` + `--posts` → Task 4. ✓
+- Volume-model doc update → Task 4 Step 5. ✓
+- Backward compat N=0 → Task 4 (`[:post_n]` with post_n=0 → empty; profile-pic-only). ✓
+
+**Placeholder scan:** none — every code step is concrete.
+
+**Type consistency:** `max_similarity(embeddings, ref_emb)` (Task 1) used by `max_similarity_to_ref` (Task 1) and `_check_one` (Task 4). `parse_profile_media`/`get_profile_media` return `{"profile_pic_url","post_urls"}` (Task 2) consumed identically in Task 4. `decide_account(image_scores, threshold, consensus_min) -> {"score","matched","is_match"}` (Task 3) used with those exact keys in Task 4.
+
+**Dependency note:** requires `Instagram` to already carry `rate_limiter`/`budget` (from `feat/rate-limit-hardening` Task 6). This plan must execute on top of that branch.

@@ -76,6 +76,7 @@ Scraping dilakukan dengan men-scroll modal followers/following di halaman (via P
 | `--workers N` | `3` | Jumlah worker paralel untuk face comparison |
 | `--threshold X` | `0.35` | Ambang kemiripan 0–1 (**lihat jebakan di bawah**) |
 | `--no-cache` | — | Abaikan cache, scrape ulang followers/following |
+| `--posts N` | `3` | Jumlah post terbaru yang di-sample per akun selain foto profil (`0` = foto profil saja) |
 | `--rate N` | `20` | Global read pace, request/menit. `0` = mati (tanpa pacing) |
 | `--max-requests N` | `800` | Budget request per-run. Search berhenti otomatis (`STOPPED early`) begitu terlampaui |
 | `--max-expand N` | `15` | Maksimum akun yang di-expand per layer BFS (cap fan-out) |
@@ -117,6 +118,17 @@ Proses juga bisa **berhenti otomatis demi keamanan** (bukan karena match) kalau 
 Nilai `--threshold` di CLI **hanya** memengaruhi print summary dan marker `<<<` pada output. Yang benar-benar menghentikan pencarian saat match adalah konstanta `config.SIM_THRESHOLD` (default `0.35`).
 
 Untuk mengubah cutoff match yang sebenarnya, ubah `config.SIM_THRESHOLD` di `modules/config.py` (atau wire nilai CLI ke `BFSSearch`).
+
+### Agregasi profil + post (`--posts`)
+
+Tiap akun dicek dengan foto profil **plus** hingga `--posts N` post terbaru (default 3). Skor per-gambar diambil dari wajah dengan similarity tertinggi di gambar itu (`max_similarity_to_ref`), lalu di-agregasi lintas gambar:
+
+- **Ranking** memakai skor **maksimum** di antara semua gambar yang dicek (foto profil + post).
+- **Auto-stop match** memakai **konsensus**: butuh minimal `config.CONSENSUS_MIN` (default 2) gambar berbeda yang similarity-nya ≥ `config.SIM_THRESHOLD`, bukan cuma satu gambar.
+- Sampling **berhenti lebih awal** begitu konsensus tercapai — post berikutnya tidak diunduh/dicek lagi untuk akun itu.
+- `--posts 0` mengembalikan ke perilaku lama (cuma foto profil, back-compat).
+
+> **Catatan konsensus:** dengan `--posts ≥ 1`, sebuah akun dihentikan-otomatis (FOUND) hanya jika **≥ `CONSENSUS_MIN` (default 2) gambar berbeda** melewati threshold. Akun yang cocok kuat hanya di profile pic (tanpa wajah cocok di post) tetap muncul peringkat teratas di top-list, tapi **tidak** menghentikan pencarian. Pakai `--posts 0` untuk perilaku lama (match dari 1 gambar).
 
 ---
 

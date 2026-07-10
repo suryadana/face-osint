@@ -67,6 +67,7 @@ Four modules under `modules/`, orchestrated by the top-level `face-osint` script
 - **PRs target the `dev` branch, not `main`.** `dev` is the integration branch on `origin`; `gh pr create --base dev --head <feature>`.
 - **Do NOT push or open PRs as Claude.** The machine's SSH key authenticates as a GitHub account without write access; the only account with access (`suryadana`) is the user's personal account and must not be used by the agent. Prepare the branch, commits, and PR title/body locally, then **let the user run the actual `git push` / `gh pr create`** (e.g. suggest `! git push ...`).
 - **Commit co-author trailer:** end commits with `Co-Authored-By: I Komang Suryadana <suryadana80@gmail.com>` — **do NOT** add the `Co-Authored-By: Claude ...` trailer (overrides the global default). Same for PR bodies: no "Generated with Claude Code" line.
+- **Ship `.superpowers/` and `.serena/`:** on every feature branch, commit the `.superpowers/` SDD artifacts (ledger, task briefs, reports, review-package diffs) and the `.serena/` project memory so they go out with the PR. `.superpowers/sdd/.gitignore` ignores them by default — force them in with `git add -f .superpowers/`.
 
 ## Notes
 

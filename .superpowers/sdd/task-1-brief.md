@@ -1,95 +1,79 @@
-### Task 1: Test harness + pure helpers (`jittered_delay`, `backoff_delay`)
+### Task 1: `max_similarity` + multi-face embedding (face.py)
 
 **Files:**
-- Create: `requirements-dev.txt`
-- Create: `pytest.ini`
-- Create: `modules/ratelimit.py`
-- Test: `tests/test_ratelimit.py`
+- Modify: `modules/face.py`
+- Test: `tests/test_face_agg.py`
 
 **Interfaces:**
 - Produces:
-  - `jittered_delay(lo: float, hi: float, rng=random) -> float`
-  - `backoff_delay(attempt: int, base: float = 2.0, cap: float = 300.0, rng=random) -> float`
+  - `max_similarity(embeddings, ref_emb) -> float | None` — module-level pure fn; max cosine over a list of embeddings; `None` if list empty.
+  - `FaceEngine.all_embeddings(img_data) -> list` — embeddings of ALL detected faces ([] if none).
+  - `FaceEngine.max_similarity_to_ref(img_data, ref_emb) -> float | None`.
 
-- [ ] **Step 1: Dev deps + pytest config**
+- [ ] **Step 1: Write failing test**
 
-`requirements-dev.txt`:
-```
-pytest
-pytest-asyncio
-```
-
-`pytest.ini`:
-```ini
-[pytest]
-asyncio_mode = auto
-testpaths = tests
-```
-
-Run: `pip install -r requirements-dev.txt`
-
-- [ ] **Step 2: Write failing test**
-
-`tests/test_ratelimit.py`:
+`tests/test_face_agg.py`:
 ```python
-import random
-from modules.ratelimit import jittered_delay, backoff_delay
+import numpy as np
+from modules.face import max_similarity
 
 
-def test_jittered_delay_within_bounds():
-    rng = random.Random(0)
-    for _ in range(100):
-        d = jittered_delay(1.0, 3.0, rng=rng)
-        assert 1.0 <= d <= 3.0
+def test_max_similarity_picks_best():
+    ref = np.array([1.0, 0.0, 0.0])
+    embs = [
+        np.array([0.0, 1.0, 0.0]),   # cos 0.0
+        np.array([1.0, 1.0, 0.0]),   # cos ~0.707
+        np.array([2.0, 0.0, 0.0]),   # cos 1.0
+    ]
+    assert abs(max_similarity(embs, ref) - 1.0) < 1e-6
 
 
-def test_jittered_delay_zero_range():
-    assert jittered_delay(0.0, 0.0) == 0.0
-
-
-def test_backoff_delay_grows_and_caps():
-    seq = [backoff_delay(a, base=2.0, cap=300.0, rng=random.Random(1)) for a in range(12)]
-    assert seq[0] < seq[3] < seq[6]         # grows
-    assert all(d <= 300.0 for d in seq)     # capped
-    assert seq[-1] == 300.0                  # deep attempt saturates cap
+def test_max_similarity_empty_is_none():
+    assert max_similarity([], np.array([1.0, 0.0])) is None
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_ratelimit.py -v`
-Expected: FAIL — `ModuleNotFoundError` / `ImportError: cannot import name 'jittered_delay'`.
+Run: `.venv/bin/pytest tests/test_face_agg.py -v`
+Expected: FAIL — `ImportError: cannot import name 'max_similarity'`.
 
-- [ ] **Step 4: Implement helpers**
+- [ ] **Step 3: Implement**
 
-`modules/ratelimit.py`:
+In `modules/face.py`, add module-level function (reuse the existing cosine formula):
 ```python
-"""Rate-limit hardening primitives (pure + async)."""
-import asyncio
-import random
+def max_similarity(embeddings, ref_emb):
+    """Max cosine similarity between ref_emb and any embedding in the list. None if empty."""
+    best = None
+    for emb in embeddings:
+        sim = float(ref_emb @ emb / (norm(ref_emb) * norm(emb)))
+        if best is None or sim > best:
+            best = sim
+    return best
+```
+Add methods to `FaceEngine`:
+```python
+    def all_embeddings(self, img_data):
+        """All face embeddings from raw image bytes (empty list if none)."""
+        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+        return [f.embedding for f in self.model.get(img)]
 
-
-def jittered_delay(lo, hi, rng=random):
-    """Random delay in [lo, hi]. Returns 0.0 when lo==hi==0."""
-    if hi <= lo:
-        return float(lo)
-    return rng.uniform(lo, hi)
-
-
-def backoff_delay(attempt, base=2.0, cap=300.0, rng=random):
-    """Exponential backoff with jitter, capped at `cap` seconds."""
-    return min(base ** attempt + rng.uniform(0, 1), cap)
+    def max_similarity_to_ref(self, img_data, ref_emb):
+        """Max similarity of ref_emb to any face found in the image bytes."""
+        return max_similarity(self.all_embeddings(img_data), ref_emb)
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/test_ratelimit.py -v`
-Expected: PASS (3 passed).
+Run: `.venv/bin/pytest tests/test_face_agg.py -v`
+Expected: PASS (2 passed).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add requirements-dev.txt pytest.ini modules/ratelimit.py tests/test_ratelimit.py
-git commit -m "feat(ratelimit): add pure jitter+backoff helpers with tests"
+git add modules/face.py tests/test_face_agg.py
+git commit -m "feat(face): add max_similarity + multi-face embedding extraction"
 ```
 
 ---
