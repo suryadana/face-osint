@@ -23,3 +23,9 @@ def test_all_none_gives_none_score():
 def test_boundary_score_equals_threshold_is_match():
     r = decide_account([0.35], threshold=0.35, consensus_min=1)
     assert r["is_match"] is True
+
+
+def test_single_image_matches_when_consensus_one():
+    # post_n=0 path: only profile score, effective consensus 1
+    r = decide_account([0.50], threshold=0.35, consensus_min=1)
+    assert r["is_match"] is True

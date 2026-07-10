@@ -71,20 +71,24 @@ class BFSSearch:
                         return None
                     self.checked_urls.add(pic_url)
 
+                # Cap consensus to the max images actually available for this account,
+                # so --posts 0 (profile pic only) preserves old single-hit match behavior.
+                effective_consensus = min(config.CONSENSUS_MIN, 1 + self.post_n)
+
                 scores = []
                 pic = await ig.download_image(pic_url)
                 if pic is not None:
                     scores.append(self.face.max_similarity_to_ref(pic, self.ref_emb))
 
                 for post_url in media["post_urls"][: self.post_n]:
-                    d = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)
+                    d = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
                     if d["is_match"]:
                         break                       # early-stop: consensus already reached
                     img = await ig.download_image(post_url)
                     if img is not None:
                         scores.append(self.face.max_similarity_to_ref(img, self.ref_emb))
 
-                decision = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)
+                decision = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
                 if decision["score"] is not None:
                     async with self.lock:
                         self.results.append((username, decision["score"]))

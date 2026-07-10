@@ -459,11 +459,11 @@ class Instagram:
 
     async def get_profile_media(self, username):
         if "instagram.com" not in self.page.url:
-            try:
-                await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
-                await self.page.wait_for_timeout(2000)
-            except Exception:
-                pass
+            await self._goto_with_retry("https://www.instagram.com/")
+            await self.page.wait_for_timeout(2000)
+
+        await self.rate_limiter.acquire()
+        await self.budget.spend()
         raw = await self.page.evaluate(f"""async () => {{
             try {{
                 var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
@@ -485,4 +485,7 @@ class Instagram:
         await self.rate_limiter.acquire()
         await self.budget.spend()
         resp = await self.page.request.get(url)
+        kind = detect_soft_block(resp.status, url, "")
+        if kind:
+            raise SoftBlockError(kind, "post_image")
         return await resp.body() if resp.ok else None
