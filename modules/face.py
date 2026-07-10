@@ -4,6 +4,15 @@ Face comparison engine — insightface buffalo_l
 import cv2, insightface, numpy as np
 from numpy.linalg import norm
 
+def max_similarity(embeddings, ref_emb):
+    """Max cosine similarity between ref_emb and any embedding in the list. None if empty."""
+    best = None
+    for emb in embeddings:
+        sim = float(ref_emb @ emb / (norm(ref_emb) * norm(emb)))
+        if best is None or sim > best:
+            best = sim
+    return best
+
 class FaceEngine:
     def __init__(self, model_name="buffalo_l"):
         self.model = insightface.app.FaceAnalysis(name=model_name)
@@ -24,6 +33,17 @@ class FaceEngine:
         faces = self.model.get(img)
         if len(faces) == 0: return None
         return faces[0].embedding
+
+    def all_embeddings(self, img_data):
+        """All face embeddings from raw image bytes (empty list if none)."""
+        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+        return [f.embedding for f in self.model.get(img)]
+
+    def max_similarity_to_ref(self, img_data, ref_emb):
+        """Max similarity of ref_emb to any face found in the image bytes."""
+        return max_similarity(self.all_embeddings(img_data), ref_emb)
 
     def compare(self, emb1, emb2):
         """Cosine similarity between two embeddings. Returns float 0-1."""
