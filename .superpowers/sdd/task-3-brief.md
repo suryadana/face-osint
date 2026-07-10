@@ -1,80 +1,65 @@
-### Task 3: `RequestBudget` + `BudgetExceeded`
+### Task 3: `decide_account` (search.py)
 
 **Files:**
-- Modify: `modules/ratelimit.py`
-- Test: `tests/test_ratelimit.py`
+- Modify: `modules/search.py`
+- Test: `tests/test_decide_account.py`
 
 **Interfaces:**
-- Produces:
-  - `class BudgetExceeded(Exception)` with attrs `.spent`, `.limit`.
-  - `RequestBudget(max_requests=None)` with `async def spend(self, n=1) -> None` (raises `BudgetExceeded` when total exceeds `max_requests`) and `.spent` int property.
+- Produces: `decide_account(image_scores, threshold, consensus_min) -> dict` — pure; input list of per-image scores (floats; `None` entries skipped); returns `{"score": float|None, "matched": int, "is_match": bool}` where `score`=max valid (None if none), `matched`=count(score>=threshold), `is_match`=`matched >= consensus_min`.
 
 - [ ] **Step 1: Write failing test**
 
-Append to `tests/test_ratelimit.py`:
+`tests/test_decide_account.py`:
 ```python
-from modules.ratelimit import RequestBudget, BudgetExceeded
+from modules.search import decide_account
 
 
-async def test_budget_counts_and_raises():
-    b = RequestBudget(max_requests=3)
-    await b.spend()          # 1
-    await b.spend(2)         # 3 (== limit, still OK)
-    assert b.spent == 3
-    with pytest.raises(BudgetExceeded) as ei:
-        await b.spend()      # 4 > 3
-    assert ei.value.limit == 3
-    assert ei.value.spent == 4
+def test_ranking_max_and_consensus_match():
+    r = decide_account([0.40, None, 0.38, 0.10], threshold=0.35, consensus_min=2)
+    assert abs(r["score"] - 0.40) < 1e-9
+    assert r["matched"] == 2
+    assert r["is_match"] is True
 
 
-async def test_budget_unlimited_when_none():
-    b = RequestBudget(max_requests=None)
-    for _ in range(1000):
-        await b.spend()
-    assert b.spent == 1000
+def test_single_hit_is_not_match_under_consensus():
+    r = decide_account([0.50, 0.10, None], threshold=0.35, consensus_min=2)
+    assert abs(r["score"] - 0.50) < 1e-9
+    assert r["matched"] == 1
+    assert r["is_match"] is False
+
+
+def test_all_none_gives_none_score():
+    r = decide_account([None, None], threshold=0.35, consensus_min=2)
+    assert r == {"score": None, "matched": 0, "is_match": False}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_ratelimit.py -k budget -v`
-Expected: FAIL — `ImportError: cannot import name 'RequestBudget'`.
+Run: `.venv/bin/pytest tests/test_decide_account.py -v`
+Expected: FAIL — `ImportError: cannot import name 'decide_account'`.
 
 - [ ] **Step 3: Implement**
 
-Append to `modules/ratelimit.py`:
+In `modules/search.py`, add module-level function:
 ```python
-class BudgetExceeded(Exception):
-    def __init__(self, spent, limit):
-        self.spent = spent
-        self.limit = limit
-        super().__init__(f"request budget exceeded: {spent} > {limit}")
-
-
-class RequestBudget:
-    """Counts total requests spent across the run; raises when over max_requests."""
-
-    def __init__(self, max_requests=None):
-        self.max_requests = max_requests
-        self.spent = 0
-        self._lock = asyncio.Lock()
-
-    async def spend(self, n=1):
-        async with self._lock:
-            self.spent += n
-            if self.max_requests is not None and self.spent > self.max_requests:
-                raise BudgetExceeded(self.spent, self.max_requests)
+def decide_account(image_scores, threshold, consensus_min):
+    """Aggregate per-image scores: max for ranking, consensus (>=consensus_min hits) for match."""
+    valid = [s for s in image_scores if s is not None]
+    score = max(valid) if valid else None
+    matched = sum(1 for s in valid if s >= threshold)
+    return {"score": score, "matched": matched, "is_match": matched >= consensus_min}
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/test_ratelimit.py -k budget -v`
-Expected: PASS (2 passed).
+Run: `.venv/bin/pytest tests/test_decide_account.py -v`
+Expected: PASS (3 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add modules/ratelimit.py tests/test_ratelimit.py
-git commit -m "feat(ratelimit): add RequestBudget with hard cap"
+git add modules/search.py tests/test_decide_account.py
+git commit -m "feat(search): add decide_account aggregation (max rank + consensus stop)"
 ```
 
 ---

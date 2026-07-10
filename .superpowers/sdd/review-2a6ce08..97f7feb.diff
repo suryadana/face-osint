@@ -1,0 +1,128 @@
+# Review package: 2a6ce08..97f7feb
+
+## Commits
+97f7feb fix(posts): --posts 0 single-hit match + govern get_profile_media/download_image (pace+budget+soft-block)
+
+## Files changed
+ modules/instagram.py         | 13 ++++++++-----
+ modules/search.py            |  8 ++++++--
+ tests/test_decide_account.py |  6 ++++++
+ 3 files changed, 20 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/modules/instagram.py b/modules/instagram.py
+index 01b2fca..8b56347 100644
+--- a/modules/instagram.py
++++ b/modules/instagram.py
+@@ -452,25 +452,25 @@ class Instagram:
+         resp = await self.page.request.get(url_data)
+         kind = detect_soft_block(resp.status, url_data, "")
+         if kind:
+             raise SoftBlockError(kind, "profile_pic")
+         if resp.ok:
+             return url_data, await resp.body()
+         return url_data, None
+ 
+     async def get_profile_media(self, username):
+         if "instagram.com" not in self.page.url:
+-            try:
+-                await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
+-                await self.page.wait_for_timeout(2000)
+-            except Exception:
+-                pass
++            await self._goto_with_retry("https://www.instagram.com/")
++            await self.page.wait_for_timeout(2000)
++
++        await self.rate_limiter.acquire()
++        await self.budget.spend()
+         raw = await self.page.evaluate(f"""async () => {{
+             try {{
+                 var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
+                 if(!csrf) return null;
+                 var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
+                     headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
+                 }});
+                 if(!r.ok) return null;
+                 return await r.json();
+             }} catch(e) {{ return null; }}
+@@ -478,11 +478,14 @@ class Instagram:
+         if not raw:
+             return {"profile_pic_url": None, "post_urls": []}
+         return parse_profile_media(raw)
+ 
+     async def download_image(self, url):
+         if not url:
+             return None
+         await self.rate_limiter.acquire()
+         await self.budget.spend()
+         resp = await self.page.request.get(url)
++        kind = detect_soft_block(resp.status, url, "")
++        if kind:
++            raise SoftBlockError(kind, "post_image")
+         return await resp.body() if resp.ok else None
+diff --git a/modules/search.py b/modules/search.py
+index 3065b0f..1d56a07 100644
+--- a/modules/search.py
++++ b/modules/search.py
+@@ -64,34 +64,38 @@ class BFSSearch:
+                                   rate_limiter=self.rate_limiter, budget=self.budget) as ig:
+                 media = await ig.get_profile_media(username)
+                 pic_url = media["profile_pic_url"]
+                 if not pic_url:
+                     return None
+                 async with self.lock:
+                     if pic_url in self.checked_urls:
+                         return None
+                     self.checked_urls.add(pic_url)
+ 
++                # Cap consensus to the max images actually available for this account,
++                # so --posts 0 (profile pic only) preserves old single-hit match behavior.
++                effective_consensus = min(config.CONSENSUS_MIN, 1 + self.post_n)
++
+                 scores = []
+                 pic = await ig.download_image(pic_url)
+                 if pic is not None:
+                     scores.append(self.face.max_similarity_to_ref(pic, self.ref_emb))
+ 
+                 for post_url in media["post_urls"][: self.post_n]:
+-                    d = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)
++                    d = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
+                     if d["is_match"]:
+                         break                       # early-stop: consensus already reached
+                     img = await ig.download_image(post_url)
+                     if img is not None:
+                         scores.append(self.face.max_similarity_to_ref(img, self.ref_emb))
+ 
+-                decision = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)
++                decision = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
+                 if decision["score"] is not None:
+                     async with self.lock:
+                         self.results.append((username, decision["score"]))
+                         self.total_face_checks += 1
+                     if decision["is_match"]:
+                         self.found.set()
+                         self.found_data[0] = (username, decision["score"])
+                         return (username, decision["score"])
+         except (SoftBlockError, BudgetExceeded) as e:
+             self.stop_reason = str(e)
+diff --git a/tests/test_decide_account.py b/tests/test_decide_account.py
+index 08c846d..60c521e 100644
+--- a/tests/test_decide_account.py
++++ b/tests/test_decide_account.py
+@@ -16,10 +16,16 @@ def test_single_hit_is_not_match_under_consensus():
+ 
+ 
+ def test_all_none_gives_none_score():
+     r = decide_account([None, None], threshold=0.35, consensus_min=2)
+     assert r == {"score": None, "matched": 0, "is_match": False}
+ 
+ 
+ def test_boundary_score_equals_threshold_is_match():
+     r = decide_account([0.35], threshold=0.35, consensus_min=1)
+     assert r["is_match"] is True
++
++
++def test_single_image_matches_when_consensus_one():
++    # post_n=0 path: only profile score, effective consensus 1
++    r = decide_account([0.50], threshold=0.35, consensus_min=1)
++    assert r["is_match"] is True

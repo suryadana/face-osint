@@ -1,0 +1,717 @@
+# Review package: c8ffbae..97f7feb
+
+## Commits
+97f7feb fix(posts): --posts 0 single-hit match + govern get_profile_media/download_image (pace+budget+soft-block)
+2a6ce08 feat: aggregate profile+post faces in search + --posts flag + docs
+3dc3701 feat(search): add decide_account aggregation (max rank + consensus stop)
+459ac15 feat(instagram): parse profile+post media, add paced download_image (Playwright)
+ab5b683 feat(face): add max_similarity + multi-face embedding extraction
+
+## Files changed
+ .superpowers/sdd/posts-task-4-report.md | 131 ++++++++++++++++++++++++++++++++
+ docs/keamanan-dan-rate-limit.md         |   2 +-
+ docs/penggunaan.md                      |  10 +++
+ face-osint                              |   7 +-
+ modules/config.py                       |   4 +
+ modules/face.py                         |  20 +++++
+ modules/instagram.py                    |  46 +++++++++++
+ modules/search.py                       |  54 +++++++++----
+ tests/test_decide_account.py            |  31 ++++++++
+ tests/test_face_agg.py                  |  16 ++++
+ tests/test_profile_media.py             |  30 ++++++++
+ 11 files changed, 336 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/posts-task-4-report.md b/.superpowers/sdd/posts-task-4-report.md
+new file mode 100644
+index 0000000..4cf74ce
+--- /dev/null
++++ b/.superpowers/sdd/posts-task-4-report.md
+@@ -0,0 +1,131 @@
++# Task 4 Report: Wire post-aggregation into BFS search + config + CLI + docs
++
++Branch: `feat/face-compare-posts`
++
++## What changed (file:line)
++
++### `modules/config.py` (+4, after existing constants, ~line 27-30)
++Added:
++```python
++# --- Post-image aggregation ---
++POST_SAMPLE_N = 3      # recent posts sampled per checked account (0 = profile pic only)
++CONSENSUS_MIN = 2      # distinct images >= SIM_THRESHOLD required to auto-stop (FOUND)
++```
++
++### `modules/search.py`
++- `BFSSearch.__init__` (line 29-34): added `post_n=None` param; `self.post_n = config.POST_SAMPLE_N if post_n is None else post_n`.
++- `_check_one` (line 62-91): replaced the old `get_profile_pic` + `compare_to_ref` single-image check with media aggregation exactly per brief:
++  - `ig.get_profile_media(username)` → `pic_url`, dedup via `checked_urls` lock as before.
++  - `scores = []`; download+score profile pic via `max_similarity_to_ref`.
++  - Loop over `media["post_urls"][:self.post_n]`: before each download, call `decide_account(scores, ...)`; break early if `is_match` (consensus already reached) — this is the early-stop that avoids downloading all N posts once consensus is hit.
++  - Final `decision = decide_account(scores, config.SIM_THRESHOLD, config.CONSENSUS_MIN)`; append `decision["score"]` to `self.results` if not None; set `self.found`/`self.found_data` on `decision["is_match"]`.
++  - `decide_account` needed no new import — it's already module-level in `modules/search.py` (Task 3, committed as `3dc3701`).
++
++### `face-osint`
++- Top docstring (~line 8-9): added `--posts N` line to the `search` options list.
++- `cmd_search` usage block (~line 159-160): added `--posts N` help line.
++- `cmd_search` defaults (~line 176-177): added `post_n = config.POST_SAMPLE_N`.
++- `cmd_search` arg-parse loop (~line 192-193): added `--posts` flag handling (`int(args[i+1])`).
++- `BFSSearch(...)` construction (~line 253): added `post_n=post_n`.
++
++### `tests/test_decide_account.py` (+5, appended)
++Added the requested boundary test:
++```python
++def test_boundary_score_equals_threshold_is_match():
++    r = decide_account([0.35], threshold=0.35, consensus_min=1)
++    assert r["is_match"] is True
++```
++(Score == threshold uses `>=` in `decide_account`, so this is `True` — matches existing implementation, no code change needed there.)
++
++### `docs/penggunaan.md`
++- Added `--posts N` row to the `search` options table (default `3`, note `0` = profile pic only).
++- Added new subsection "Agregasi profil + post (`--posts`)" explaining: per-image scoring via `max_similarity_to_ref`, ranking by max score across all checked images, auto-stop via consensus (`config.CONSENSUS_MIN`, default 2 images ≥ `SIM_THRESHOLD`), early-stop behavior, and `--posts 0` back-compat.
++
++### `docs/keamanan-dan-rate-limit.md`
++- Updated "Model volume request" paragraph: per-account cost for profile-pic-only is unchanged (~3 request/akun), but with `--posts N` aggregation it rises to **~3 + (1..N) request/akun**, bounded by how many posts are actually downloaded before consensus is reached or `post_urls` is exhausted. Noted that post-image downloads go through the same `download_image` → `rate_limiter`/`budget` path as other requests, so the extra volume is still governed by `--rate`/`--max-requests`, not unbounded. Left the depth 1/2/3 order-of-magnitude table (~10³/10⁵/10⁶–10⁷) unchanged since a small constant multiplier (1-3x) doesn't change the order of magnitude.
++
++## Verification evidence
++
++### 1. `.venv/bin/pytest tests/ -v`
++```
++collected 25 items
++
++tests/test_config.py::test_hardening_defaults_exist PASSED             [  4%]
++tests/test_decide_account.py::test_ranking_max_and_consensus_match PASSED [  8%]
++tests/test_decide_account.py::test_single_hit_is_not_match_under_consensus PASSED [ 12%]
++tests/test_decide_account.py::test_all_none_gives_none_score PASSED    [ 16%]
++tests/test_decide_account.py::test_boundary_score_equals_threshold_is_match PASSED [ 20%]
++tests/test_face_agg.py::test_max_similarity_picks_best PASSED          [ 24%]
++tests/test_face_agg.py::test_max_similarity_empty_is_none PASSED       [ 28%]
++tests/test_instagram_softblock.py::test_goto_raises_on_login_redirect PASSED [ 32%]
++tests/test_instagram_softblock.py::test_goto_ok_returns_response PASSED [ 36%]
++tests/test_profile_media.py::test_parse_extracts_pic_and_posts PASSED  [ 40%]
++tests/test_profile_media.py::test_parse_falls_back_to_lo_pic_and_empty_posts PASSED [ 44%]
++tests/test_profile_media.py::test_parse_handles_missing_user PASSED    [ 48%]
++tests/test_ratelimit.py::test_jittered_delay_within_bounds PASSED      [ 52%]
++tests/test_ratelimit.py::test_jittered_delay_zero_range PASSED         [ 56%]
++tests/test_ratelimit.py::test_backoff_delay_grows_and_caps PASSED      [ 60%]
++tests/test_ratelimit.py::test_rate_limiter_spaces_calls PASSED         [ 64%]
++tests/test_ratelimit.py::test_rate_limiter_disabled PASSED             [ 68%]
++tests/test_ratelimit.py::test_budget_counts_and_raises PASSED          [ 72%]
++tests/test_ratelimit.py::test_budget_unlimited_when_none PASSED        [ 76%]
++tests/test_ratelimit.py::test_detect_login_redirect PASSED             [ 80%]
++tests/test_ratelimit.py::test_detect_body_markers PASSED               [ 84%]
++tests/test_ratelimit.py::test_429_is_not_soft_block PASSED             [ 88%]
++tests/test_ratelimit.py::test_clean_response_is_none PASSED            [ 92%]
++tests/test_search_limits.py::test_cap_expansions_limits_count PASSED   [ 96%]
++tests/test_search_limits.py::test_cap_expansions_none_disables PASSED  [100%]
++
++============================== 25 passed in 0.20s ==============================
++```
++25 passing (24 pre-existing + 1 new boundary test), matches expectation exactly.
++
++### 2. `.venv/bin/python3.11 face-osint search` (no args, exit code 1)
++```
++Usage: face-osint search <ref_image> <instagram_username> [options]
++Options:
++  --depth N     Graph depth (0=user only, 1=followers/following, 2=their friends, ...)
++  --workers N   Parallel workers (default 3)
++  --threshold X Match threshold 0-1 (default 0.35)
++  --no-cache    Re-scrape followers/following, ignore saved cache
++  --posts N     Recent posts sampled per account (default 3; 0=profile pic only)
++  --rate N        Global read pace, requests/min (default 20; 0=off)
++  --max-requests N  Per-run request budget (default 800)
++  --max-expand N  Max accounts expanded per layer (default 15)
++  --delay-min X / --delay-max X  Jittered inter-action delay seconds
++
++Examples:
++  face-osint search ref.jpg target_user --depth 1
++  face-osint search ref.jpg target_user --depth 3 --workers 5
++```
++`--posts N` line present, as required.
++
++### Step 4 (manual real-run verification) — NOT PERFORMED
++No Instagram cookie/network available in this environment per task instructions ("do NOT attempt a real search"). Skipped per explicit instruction in the task brief/prompt. This is a known gap versus the brief's Step 4 (real-run smoke with `--cookie` against a live account) — purely offline verification (pytest + CLI usage) was performed instead, as directed.
++
++## Files changed
++- `modules/config.py`
++- `modules/search.py`
++- `face-osint`
++- `tests/test_decide_account.py`
++- `docs/penggunaan.md`
++- `docs/keamanan-dan-rate-limit.md`
++
++(Note: `.superpowers/sdd/task-1-brief.md` through `task-4-brief.md` and `.superpowers/sdd/progress.md` showed as modified in `git status` at session start — these were already dirty before this task began and were NOT touched by this task's work. They are left untouched/uncommitted by this task's commit, which only stages the 6 files above.)
++
++## Self-review
++
++- Code in `modules/search.py` `_check_one` matches the brief's snippet verbatim (variable names, control flow, break condition, lock scoping identical).
++- `config.py` additions match verbatim (comment text, values).
++- CLI additions (`--posts` parsing, help lines, `post_n=` passthrough) match brief verbatim.
++- Backward compat: `--posts 0` / `POST_SAMPLE_N=0` → `media["post_urls"][:0]` is `[]`, loop body never runs, `scores` only ever has the profile-pic score → identical to old profile-pic-only behavior (modulo `compare_to_ref` vs `max_similarity_to_ref`, which was already changed in Task 1 to be multi-face-aware but functionally equivalent for a single-face image).
++- Python 3.9 compatibility: no `match` statement, no `X | Y` type unions introduced.
++- Scraping-related work still only uses `Instagram.get_profile_media`/`download_image`, both Playwright-backed (verified in `modules/instagram.py` — `download_image` uses `self.page.request.get`, `get_profile_media` uses in-page `fetch()` via `page.evaluate`). No raw-HTTP client added.
++- Test added exactly as specified: `decide_account([0.35], threshold=0.35, consensus_min=1)["is_match"] is True` — passes because `decide_account` uses `s >= threshold` (line 24 of `modules/search.py`), so `0.35 >= 0.35` counts as 1 match, `1 >= consensus_min(1)` → True. No implementation change needed for this to hold; it was already correct.
++- Commit co-author trailer set per instructions.
++
++## Concerns
++
++1. **Real-run manual verification (brief Step 4) was not performed** — no cookie/network in this environment, and the task instructions explicitly said not to attempt a real search. This means the actual behavioral claim in the brief ("post version should surface a score where profile-pic-only detected no face") is unverified end-to-end in this session. Recommend a follow-up manual smoke test with a real cookie before merging to `dev`/`main`, per the brief's own Step 4.
++2. Did not add a `Posts:` line to the `cmd_search` startup print block (which prints `Reference:`, `Threshold:`, `Workers:`, `Depth:`) — this is a minor UX nicety not required by the brief, omitted to avoid scope creep beyond the exact spec.
++3. The volume-model doc update is qualitative/order-of-magnitude (kept the existing ~10³/10⁵/10⁶–10⁷ table as-is since a 1-4x per-account multiplier doesn't change order of magnitude) rather than recomputing exact numbers — this matches the brief's instruction ("per-account cost rises to ~3 + (1..N)... bounded by limiter/budget + consensus early-stop") which asked for the narrative update, not a new table.
+diff --git a/docs/keamanan-dan-rate-limit.md b/docs/keamanan-dan-rate-limit.md
+index 4e1f125..ce60ef5 100644
+--- a/docs/keamanan-dan-rate-limit.md
++++ b/docs/keamanan-dan-rate-limit.md
+@@ -13,21 +13,21 @@ Project ini memang sudah memakai Playwright (browser asli). Itu menyelesaikan **
+ | Lapisan | Playwright menolong? | Alasan |
+ |---|---|---|
+ | **Transport / fingerprint** (TLS/JA3, urutan header) | ✅ Ya | Browser asli = handshake asli. Ini yang membuat client HTTP Python (`requests`/`httpx`) diblok instan. Playwright lolos. |
+ | **IP** (reputasi, ASN, volume) | ❌ Tidak | Semua traffic tetap keluar dari satu IP. Datacenter IP diblok di request pertama; IP rumah kena throttle saat volume tinggi. |
+ | **Akun / perilaku** (trust-score, pola baca) | ❌ Tidak | Ini pembunuh sebenarnya. Enumerasi follower-list linier lintas banyak node = pola bot. Yang kena flag adalah `sessionid`-mu, bukan browsernya. |
+ 
+ **Rate-limit itu berbasis perilaku + akun + IP, bukan berbasis alat.** Playwright mengangkat kualitas transport ke level browser asli (itu sebabnya arsitektur ini "benar"), tapi tidak menyentuh sama sekali risiko trust-akun.
+ 
+ ## Model volume request
+ 
+-Per akun yang **dicek**: konteks browser baru + navigasi ke `/` + XHR `web_profile_info` + fetch gambar ≈ **3 request/akun**. Per akun yang **di-expand**: ~2 navigasi + puluhan XHR list.
++Per akun yang **dicek**: konteks browser baru + navigasi ke `/` + XHR `web_profile_info` + fetch gambar ≈ **3 request/akun** untuk foto profil saja. Dengan agregasi profil+post (`--posts N`, default 3), tiap akun yang dicek bisa menambah **1..N fetch gambar post** di atas base 3 request — jadi biaya per-akun naik menjadi **~3 + (1..N) request**, tergantung berapa post yang benar-benar diunduh sebelum konsensus (`config.CONSENSUS_MIN`) tercapai atau `post_urls` habis. Sampling **berhenti lebih awal** begitu konsensus match tercapai (tidak selalu mengunduh semua N post), dan seluruh fetch gambar post tetap lewat `download_image` yang dipacing oleh `rate_limiter`/`budget` yang sama seperti request lain — jadi volume tambahan ini tetap dibatasi oleh `--rate`/`--max-requests`, bukan unbounded. Per akun yang **di-expand**: ~2 navigasi + puluhan XHR list.
+ 
+ Dengan followers cap 100, following cap 500, workers 3:
+ 
+ | Depth | Estimasi request | Kenapa |
+ |---|---|---|
+ | **1** | **~10³** | Hanya layer-0; Phase 2 di-skip (`search.py`, `depth <= 1`). |
+ | **2** | **~10⁵** | **Setiap akun non-match di-expand** — fan-out ~600/akun. |
+ | **3** | **~10⁶–10⁷** | Dua generasi expansion, tanpa cap dan tanpa budget. Praktis unbounded. |
+ 
+ Instagram meng-action-block klien tidak resmi jauh di bawah ~1.000 hit profil/graph per hari. **Bahkan depth 1 sudah melewati garis aman; depth 2–3 katastrofik.**
+diff --git a/docs/penggunaan.md b/docs/penggunaan.md
+index a72a1fe..909cb7d 100644
+--- a/docs/penggunaan.md
++++ b/docs/penggunaan.md
+@@ -69,20 +69,21 @@ Scraping dilakukan dengan men-scroll modal followers/following di halaman (via P
+ ```
+ 
+ ### Opsi
+ 
+ | Opsi | Default | Keterangan |
+ |---|---|---|
+ | `--depth N` | `1` | Kedalaman graph. 1 = followers/following target; 2 = plus teman-temannya; dst. |
+ | `--workers N` | `3` | Jumlah worker paralel untuk face comparison |
+ | `--threshold X` | `0.35` | Ambang kemiripan 0–1 (**lihat jebakan di bawah**) |
+ | `--no-cache` | — | Abaikan cache, scrape ulang followers/following |
++| `--posts N` | `3` | Jumlah post terbaru yang di-sample per akun selain foto profil (`0` = foto profil saja) |
+ | `--rate N` | `20` | Global read pace, request/menit. `0` = mati (tanpa pacing) |
+ | `--max-requests N` | `800` | Budget request per-run. Search berhenti otomatis (`STOPPED early`) begitu terlampaui |
+ | `--max-expand N` | `15` | Maksimum akun yang di-expand per layer BFS (cap fan-out) |
+ | `--delay-min X` / `--delay-max X` | `1.0` / `3.0` | Rentang delay jitter (detik) antar aksi, di atas pacing `--rate` |
+ 
+ ### Contoh
+ 
+ ```bash
+ # Depth 1 — cek followers/following target saja
+ ./face-osint search ref.jpg target --depth 1 --workers 4
+@@ -111,20 +112,29 @@ Proses juga bisa **berhenti otomatis demi keamanan** (bukan karena match) kalau
+ ```
+ 
+ > ⚠️ **Baca [keamanan-dan-rate-limit.md](keamanan-dan-rate-limit.md) sebelum memakai `--depth 2` atau lebih.** Volume request meledak secara eksponensial dan hampir pasti berujung ban akun. `--rate`/`--max-requests`/`--max-expand` mengurangi risiko tapi tidak menghilangkannya.
+ 
+ ### ⚠️ Jebakan: `--threshold` tidak menghentikan search
+ 
+ Nilai `--threshold` di CLI **hanya** memengaruhi print summary dan marker `<<<` pada output. Yang benar-benar menghentikan pencarian saat match adalah konstanta `config.SIM_THRESHOLD` (default `0.35`).
+ 
+ Untuk mengubah cutoff match yang sebenarnya, ubah `config.SIM_THRESHOLD` di `modules/config.py` (atau wire nilai CLI ke `BFSSearch`).
+ 
++### Agregasi profil + post (`--posts`)
++
++Tiap akun dicek dengan foto profil **plus** hingga `--posts N` post terbaru (default 3). Skor per-gambar diambil dari wajah dengan similarity tertinggi di gambar itu (`max_similarity_to_ref`), lalu di-agregasi lintas gambar:
++
++- **Ranking** memakai skor **maksimum** di antara semua gambar yang dicek (foto profil + post).
++- **Auto-stop match** memakai **konsensus**: butuh minimal `config.CONSENSUS_MIN` (default 2) gambar berbeda yang similarity-nya ≥ `config.SIM_THRESHOLD`, bukan cuma satu gambar.
++- Sampling **berhenti lebih awal** begitu konsensus tercapai — post berikutnya tidak diunduh/dicek lagi untuk akun itu.
++- `--posts 0` mengembalikan ke perilaku lama (cuma foto profil, back-compat).
++
+ ---
+ 
+ ## `list` — lihat hasil search
+ 
+ ```bash
+ ./face-osint list
+ ./face-osint list path/ke/face_search_result.json
+ ```
+ 
+ Tanpa argumen, membaca `modules/results/face_search_result.json`. Menampilkan total akun dicek, jumlah wajah terdeteksi, status match, dan top matches.
+diff --git a/face-osint b/face-osint
+index fee79cf..0859a96 100755
+--- a/face-osint
++++ b/face-osint
+@@ -1,20 +1,21 @@
+ #!/usr/bin/env python3
+ """
+ Face OSINT — Instagram Face Search Toolkit
+ 
+ Commands:
+   compare   <ref_image> <target_image>          Compare two face images
+   search    <ref_image> <username> [options]    Recursive face-search through social graph
+     --depth N    Graph depth (1=direct, 2=friends-of-friends, 3=...)
+     --workers N  Parallel checks (default 3)
+     --threshold X  Match threshold 0-1 (default 0.35)
++    --posts N       Recent posts sampled per account (default 3; 0=profile pic only)
+     --rate N        Global read pace, requests/min (default 20; 0=off)
+     --max-requests N  Per-run request budget (default 800)
+     --max-expand N  Max accounts expanded per layer (default 15)
+     --delay-min X / --delay-max X  Jittered inter-action delay seconds
+   scrape    <username> [options]                Scrape followers/following lists
+   pic       <username> [options]                Download profile picture
+   list      <file>                              List results from a saved search
+ 
+ Global options (use before command):
+   --cookie "<string>"     Instagram cookie string (env: IG_COOKIE)
+@@ -150,52 +151,56 @@ async def _scrape_user(username, cookie, rate_limiter=None, budget=None):
+     return followers, following
+ 
+ async def cmd_search(args):
+     if len(args) < 2:
+         print("Usage: face-osint search <ref_image> <instagram_username> [options]")
+         print("Options:")
+         print("  --depth N     Graph depth (0=user only, 1=followers/following, 2=their friends, ...)")
+         print("  --workers N   Parallel workers (default 3)")
+         print("  --threshold X Match threshold 0-1 (default 0.35)")
+         print("  --no-cache    Re-scrape followers/following, ignore saved cache")
++        print("  --posts N     Recent posts sampled per account (default 3; 0=profile pic only)")
+         print("  --rate N        Global read pace, requests/min (default 20; 0=off)")
+         print("  --max-requests N  Per-run request budget (default 800)")
+         print("  --max-expand N  Max accounts expanded per layer (default 15)")
+         print("  --delay-min X / --delay-max X  Jittered inter-action delay seconds")
+         print("")
+         print("Examples:")
+         print("  face-osint search ref.jpg target_user --depth 1")
+         print("  face-osint search ref.jpg target_user --depth 3 --workers 5")
+         return 1
+     ref_path = args[0]
+     username = args[1]
+     cookie = resolve_cookie()
+ 
+     workers = config.WORKERS
+     threshold = config.SIM_THRESHOLD
+     depth = 1
+     no_cache = False
++    post_n = config.POST_SAMPLE_N
+     rate = config.RATE_PER_MIN
+     max_requests = config.MAX_REQUESTS
+     max_expand = config.MAX_EXPANSIONS_PER_LAYER
+     delay_min, delay_max = config.DELAY_RANGE
+ 
+     i = 2
+     while i < len(args):
+         if args[i] == "--workers" and i + 1 < len(args):
+             workers = int(args[i + 1]); i += 2
+         elif args[i] == "--threshold" and i + 1 < len(args):
+             threshold = float(args[i + 1]); i += 2
+         elif args[i] == "--depth" and i + 1 < len(args):
+             depth = int(args[i + 1]); i += 2
+         elif args[i] == "--no-cache":
+             no_cache = True; i += 1
++        elif args[i] == "--posts" and i + 1 < len(args):
++            post_n = int(args[i + 1]); i += 2
+         elif args[i] == "--rate" and i + 1 < len(args):
+             rate = int(args[i + 1]); i += 2
+         elif args[i] == "--max-requests" and i + 1 < len(args):
+             max_requests = int(args[i + 1]); i += 2
+         elif args[i] == "--max-expand" and i + 1 < len(args):
+             max_expand = int(args[i + 1]); i += 2
+         elif args[i] == "--delay-min" and i + 1 < len(args):
+             delay_min = float(args[i + 1]); i += 2
+         elif args[i] == "--delay-max" and i + 1 < len(args):
+             delay_max = float(args[i + 1]); i += 2
+@@ -241,21 +246,21 @@ async def cmd_search(args):
+         followers = json.load(open(followers_path))
+         following = json.load(open(following_path))
+         print(f"  Loaded {len(followers)} followers, {len(following)} following from cache")
+ 
+     layer0 = list(dict.fromkeys(followers + following))
+     print(f"\nLayer 0: {len(layer0)} unique accounts")
+     print(f"Searching with {workers} parallel workers...")
+ 
+     searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers,
+                          face_engine=engine, ref_emb=ref_emb,
+-                         rate_limiter=limiter, budget=budget)
++                         rate_limiter=limiter, budget=budget, post_n=post_n)
+     t0 = time.time()
+     results = await searcher.search(layer0, depth=depth)
+     elapsed = time.time() - t0
+ 
+     if searcher.stop_reason:
+         print(f"\n  STOPPED early (safety): {searcher.stop_reason}")
+ 
+     print(f"\nDone in {elapsed:.0f}s")
+     print(f"Faces detected: {len(searcher.results)}")
+ 
+diff --git a/modules/config.py b/modules/config.py
+index 5a60065..c09b69d 100644
+--- a/modules/config.py
++++ b/modules/config.py
+@@ -19,10 +19,14 @@ PLAYWRIGHT_TIMEOUT = 15000
+ PAGE_WAIT = 1500
+ WORKERS = 3
+ MAX_DEPTH = 3
+ 
+ # --- Rate-limit hardening ---
+ RATE_PER_MIN = 20                 # global read pace (requests/min); 0 disables
+ DELAY_RANGE = (1.0, 3.0)          # jittered inter-action delay (seconds)
+ MAX_REQUESTS = 800                # per-run request budget; None disables
+ MAX_EXPANSIONS_PER_LAYER = 15     # cap accounts expanded per BFS layer; None disables
+ BACKOFF_CAP = 300                 # max backoff seconds (was hardcoded 30)
++
++# --- Post-image aggregation ---
++POST_SAMPLE_N = 3      # recent posts sampled per checked account (0 = profile pic only)
++CONSENSUS_MIN = 2      # distinct images >= SIM_THRESHOLD required to auto-stop (FOUND)
+diff --git a/modules/face.py b/modules/face.py
+index baff121..08376f9 100644
+--- a/modules/face.py
++++ b/modules/face.py
+@@ -1,16 +1,25 @@
+ """
+ Face comparison engine — insightface buffalo_l
+ """
+ import cv2, insightface, numpy as np
+ from numpy.linalg import norm
+ 
++def max_similarity(embeddings, ref_emb):
++    """Max cosine similarity between ref_emb and any embedding in the list. None if empty."""
++    best = None
++    for emb in embeddings:
++        sim = float(ref_emb @ emb / (norm(ref_emb) * norm(emb)))
++        if best is None or sim > best:
++            best = sim
++    return best
++
+ class FaceEngine:
+     def __init__(self, model_name="buffalo_l"):
+         self.model = insightface.app.FaceAnalysis(name=model_name)
+         self.model.prepare(ctx_id=0)
+ 
+     def get_embedding(self, img_data):
+         """Extract face embedding from raw image bytes. Returns embedding or None."""
+         img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+         if img is None: return None
+         faces = self.model.get(img)
+@@ -18,20 +27,31 @@ class FaceEngine:
+         return faces[0].embedding
+ 
+     def get_embedding_from_path(self, path):
+         """Extract face embedding from image file path."""
+         img = cv2.imread(path)
+         if img is None: return None
+         faces = self.model.get(img)
+         if len(faces) == 0: return None
+         return faces[0].embedding
+ 
++    def all_embeddings(self, img_data):
++        """All face embeddings from raw image bytes (empty list if none)."""
++        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
++        if img is None:
++            return []
++        return [f.embedding for f in self.model.get(img)]
++
++    def max_similarity_to_ref(self, img_data, ref_emb):
++        """Max similarity of ref_emb to any face found in the image bytes."""
++        return max_similarity(self.all_embeddings(img_data), ref_emb)
++
+     def compare(self, emb1, emb2):
+         """Cosine similarity between two embeddings. Returns float 0-1."""
+         return float(emb1 @ emb2 / (norm(emb1) * norm(emb2)))
+ 
+     def compare_images(self, img_data1, img_data2):
+         """Compare two face images (raw bytes). Returns (sim, emb1, emb2) or (None, None, None)."""
+         emb1 = self.get_embedding(img_data1)
+         emb2 = self.get_embedding(img_data2)
+         if emb1 is None or emb2 is None: return None, None, None
+         return self.compare(emb1, emb2), emb1, emb2
+diff --git a/modules/instagram.py b/modules/instagram.py
+index 2b23162..8b56347 100644
+--- a/modules/instagram.py
++++ b/modules/instagram.py
+@@ -3,20 +3,33 @@ Instagram scraper — Playwright Async API
+ """
+ import json, re, asyncio
+ from playwright.async_api import async_playwright
+ 
+ from modules import config
+ from modules.ratelimit import (
+     RateLimiter, RequestBudget, backoff_delay,
+     detect_soft_block, SoftBlockError, jittered_delay,
+ )
+ 
++def parse_profile_media(api_json):
++    """Extract profile pic URL + recent post image URLs from a web_profile_info response."""
++    user = ((api_json or {}).get("data") or {}).get("user") or {}
++    pic = (user.get("hd_profile_pic_url_info") or {}).get("url") or user.get("profile_pic_url")
++    edges = (user.get("edge_owner_to_timeline_media") or {}).get("edges") or []
++    posts = []
++    for e in edges:
++        node = e.get("node") or {}
++        u = node.get("display_url") or node.get("thumbnail_src")
++        if u:
++            posts.append(u)
++    return {"profile_pic_url": pic, "post_urls": posts}
++
+ # Shared browser — one Playwright instance across all Instagram objects
+ _pw = None
+ _browser = None
+ _browser_lock = asyncio.Lock()
+ _owns_browser = False
+ 
+ async def ensure_browser(headless=True):
+     global _pw, _browser
+     if _pw is None:
+         async with _browser_lock:
+@@ -436,10 +449,43 @@ class Instagram:
+         if not url_data:
+             return None, None
+ 
+         resp = await self.page.request.get(url_data)
+         kind = detect_soft_block(resp.status, url_data, "")
+         if kind:
+             raise SoftBlockError(kind, "profile_pic")
+         if resp.ok:
+             return url_data, await resp.body()
+         return url_data, None
++
++    async def get_profile_media(self, username):
++        if "instagram.com" not in self.page.url:
++            await self._goto_with_retry("https://www.instagram.com/")
++            await self.page.wait_for_timeout(2000)
++
++        await self.rate_limiter.acquire()
++        await self.budget.spend()
++        raw = await self.page.evaluate(f"""async () => {{
++            try {{
++                var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
++                if(!csrf) return null;
++                var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
++                    headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
++                }});
++                if(!r.ok) return null;
++                return await r.json();
++            }} catch(e) {{ return null; }}
++        }}""")
++        if not raw:
++            return {"profile_pic_url": None, "post_urls": []}
++        return parse_profile_media(raw)
++
++    async def download_image(self, url):
++        if not url:
++            return None
++        await self.rate_limiter.acquire()
++        await self.budget.spend()
++        resp = await self.page.request.get(url)
++        kind = detect_soft_block(resp.status, url, "")
++        if kind:
++            raise SoftBlockError(kind, "post_image")
++        return await resp.body() if resp.ok else None
+diff --git a/modules/search.py b/modules/search.py
+index ced7454..1d56a07 100644
+--- a/modules/search.py
++++ b/modules/search.py
+@@ -10,26 +10,35 @@ from modules.face import FaceEngine
+ from modules.ratelimit import SoftBlockError, BudgetExceeded
+ 
+ 
+ def cap_expansions(candidates, max_per_layer):
+     """Return at most max_per_layer candidates (None => no cap)."""
+     if max_per_layer is None:
+         return list(candidates)
+     return list(candidates)[:max_per_layer]
+ 
+ 
++def decide_account(image_scores, threshold, consensus_min):
++    """Aggregate per-image scores: max for ranking, consensus (>=consensus_min hits) for match."""
++    valid = [s for s in image_scores if s is not None]
++    score = max(valid) if valid else None
++    matched = sum(1 for s in valid if s >= threshold)
++    return {"score": score, "matched": matched, "is_match": matched >= consensus_min}
++
++
+ class BFSSearch:
+     def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None,
+-                 rate_limiter=None, budget=None):
++                 rate_limiter=None, budget=None, post_n=None):
+         self.ref_path = ref_image_path
+         self.cookie = cookie_string or config.COOKIE_STRING
+         self.workers = workers or config.WORKERS
++        self.post_n = config.POST_SAMPLE_N if post_n is None else post_n
+         if face_engine:
+             self.face = face_engine
+             self.ref_emb = ref_emb
+         else:
+             self.face = FaceEngine(config.MODEL_NAME)
+             self.ref_emb = self.face.get_embedding_from_path(ref_image_path)
+         if self.ref_emb is None:
+             raise ValueError(f"No face detected in reference image: {ref_image_path}")
+         self.checked_users = set()
+         self.checked_urls = set()
+@@ -46,36 +55,55 @@ class BFSSearch:
+ 
+     async def _check_one(self, username):
+         if self.found.is_set(): return None
+         async with self.lock:
+             if username in self.checked_users: return None
+             self.checked_users.add(username)
+ 
+         try:
+             async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True,
+                                   rate_limiter=self.rate_limiter, budget=self.budget) as ig:
+-                url, pic = await ig.get_profile_pic(username)
+-                if not pic: return None
+-
++                media = await ig.get_profile_media(username)
++                pic_url = media["profile_pic_url"]
++                if not pic_url:
++                    return None
+                 async with self.lock:
+-                    if url in self.checked_urls: return None
+-                    self.checked_urls.add(url)
+-
+-                sim = self.face.compare_to_ref(pic, self.ref_emb)
+-                if sim is not None:
++                    if pic_url in self.checked_urls:
++                        return None
++                    self.checked_urls.add(pic_url)
++
++                # Cap consensus to the max images actually available for this account,
++                # so --posts 0 (profile pic only) preserves old single-hit match behavior.
++                effective_consensus = min(config.CONSENSUS_MIN, 1 + self.post_n)
++
++                scores = []
++                pic = await ig.download_image(pic_url)
++                if pic is not None:
++                    scores.append(self.face.max_similarity_to_ref(pic, self.ref_emb))
++
++                for post_url in media["post_urls"][: self.post_n]:
++                    d = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
++                    if d["is_match"]:
++                        break                       # early-stop: consensus already reached
++                    img = await ig.download_image(post_url)
++                    if img is not None:
++                        scores.append(self.face.max_similarity_to_ref(img, self.ref_emb))
++
++                decision = decide_account(scores, config.SIM_THRESHOLD, effective_consensus)
++                if decision["score"] is not None:
+                     async with self.lock:
+-                        self.results.append((username, sim))
++                        self.results.append((username, decision["score"]))
+                         self.total_face_checks += 1
+-                    if sim >= config.SIM_THRESHOLD:
++                    if decision["is_match"]:
+                         self.found.set()
+-                        self.found_data[0] = (username, sim)
+-                        return (username, sim)
++                        self.found_data[0] = (username, decision["score"])
++                        return (username, decision["score"])
+         except (SoftBlockError, BudgetExceeded) as e:
+             self.stop_reason = str(e)
+             self.stopped.set()
+             self.found.set()   # reuse existing short-circuit to unwind everything
+             return None
+         except Exception as e:
+             print(f"  _check_one error @{username}: {e}", flush=True)
+         return None
+ 
+     async def search(self, usernames, depth=1, batch_label=""):
+diff --git a/tests/test_decide_account.py b/tests/test_decide_account.py
+new file mode 100644
+index 0000000..60c521e
+--- /dev/null
++++ b/tests/test_decide_account.py
+@@ -0,0 +1,31 @@
++from modules.search import decide_account
++
++
++def test_ranking_max_and_consensus_match():
++    r = decide_account([0.40, None, 0.38, 0.10], threshold=0.35, consensus_min=2)
++    assert abs(r["score"] - 0.40) < 1e-9
++    assert r["matched"] == 2
++    assert r["is_match"] is True
++
++
++def test_single_hit_is_not_match_under_consensus():
++    r = decide_account([0.50, 0.10, None], threshold=0.35, consensus_min=2)
++    assert abs(r["score"] - 0.50) < 1e-9
++    assert r["matched"] == 1
++    assert r["is_match"] is False
++
++
++def test_all_none_gives_none_score():
++    r = decide_account([None, None], threshold=0.35, consensus_min=2)
++    assert r == {"score": None, "matched": 0, "is_match": False}
++
++
++def test_boundary_score_equals_threshold_is_match():
++    r = decide_account([0.35], threshold=0.35, consensus_min=1)
++    assert r["is_match"] is True
++
++
++def test_single_image_matches_when_consensus_one():
++    # post_n=0 path: only profile score, effective consensus 1
++    r = decide_account([0.50], threshold=0.35, consensus_min=1)
++    assert r["is_match"] is True
+diff --git a/tests/test_face_agg.py b/tests/test_face_agg.py
+new file mode 100644
+index 0000000..a6abcd4
+--- /dev/null
++++ b/tests/test_face_agg.py
+@@ -0,0 +1,16 @@
++import numpy as np
++from modules.face import max_similarity
++
++
++def test_max_similarity_picks_best():
++    ref = np.array([1.0, 0.0, 0.0])
++    embs = [
++        np.array([0.0, 1.0, 0.0]),   # cos 0.0
++        np.array([1.0, 1.0, 0.0]),   # cos ~0.707
++        np.array([2.0, 0.0, 0.0]),   # cos 1.0
++    ]
++    assert abs(max_similarity(embs, ref) - 1.0) < 1e-6
++
++
++def test_max_similarity_empty_is_none():
++    assert max_similarity([], np.array([1.0, 0.0])) is None
+diff --git a/tests/test_profile_media.py b/tests/test_profile_media.py
+new file mode 100644
+index 0000000..6328cb6
+--- /dev/null
++++ b/tests/test_profile_media.py
+@@ -0,0 +1,30 @@
++from modules.instagram import parse_profile_media
++
++
++def _api(user):
++    return {"data": {"user": user}}
++
++
++def test_parse_extracts_pic_and_posts():
++    user = {
++        "hd_profile_pic_url_info": {"url": "https://cdn/hd.jpg"},
++        "profile_pic_url": "https://cdn/lo.jpg",
++        "edge_owner_to_timeline_media": {"edges": [
++            {"node": {"display_url": "https://cdn/p1.jpg"}},
++            {"node": {"display_url": "https://cdn/p2.jpg"}},
++        ]},
++    }
++    out = parse_profile_media(_api(user))
++    assert out["profile_pic_url"] == "https://cdn/hd.jpg"      # hd preferred
++    assert out["post_urls"] == ["https://cdn/p1.jpg", "https://cdn/p2.jpg"]
++
++
++def test_parse_falls_back_to_lo_pic_and_empty_posts():
++    out = parse_profile_media(_api({"profile_pic_url": "https://cdn/lo.jpg"}))
++    assert out["profile_pic_url"] == "https://cdn/lo.jpg"
++    assert out["post_urls"] == []
++
++
++def test_parse_handles_missing_user():
++    out = parse_profile_media({"data": {}})
++    assert out == {"profile_pic_url": None, "post_urls": []}
