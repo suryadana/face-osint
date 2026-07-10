@@ -51,3 +51,24 @@ async def test_rate_limiter_disabled():
     await rl.acquire()
     await rl.acquire()
     assert slept == []           # disabled => never sleeps
+
+
+from modules.ratelimit import RequestBudget, BudgetExceeded
+
+
+async def test_budget_counts_and_raises():
+    b = RequestBudget(max_requests=3)
+    await b.spend()          # 1
+    await b.spend(2)         # 3 (== limit, still OK)
+    assert b.spent == 3
+    with pytest.raises(BudgetExceeded) as ei:
+        await b.spend()      # 4 > 3
+    assert ei.value.limit == 3
+    assert ei.value.spent == 4
+
+
+async def test_budget_unlimited_when_none():
+    b = RequestBudget(max_requests=None)
+    for _ in range(1000):
+        await b.spend()
+    assert b.spent == 1000

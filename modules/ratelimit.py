@@ -36,3 +36,25 @@ class RateLimiter:
                 await self._sleep(wait)
             extra = jittered_delay(*self.jitter_range)
             self._next_allowed = self._time() + self.min_interval + extra
+
+
+class BudgetExceeded(Exception):
+    def __init__(self, spent, limit):
+        self.spent = spent
+        self.limit = limit
+        super().__init__(f"request budget exceeded: {spent} > {limit}")
+
+
+class RequestBudget:
+    """Counts total requests spent across the run; raises when over max_requests."""
+
+    def __init__(self, max_requests=None):
+        self.max_requests = max_requests
+        self.spent = 0
+        self._lock = asyncio.Lock()
+
+    async def spend(self, n=1):
+        async with self._lock:
+            self.spent += n
+            if self.max_requests is not None and self.spent > self.max_requests:
+                raise BudgetExceeded(self.spent, self.max_requests)
