@@ -1,0 +1,230 @@
+# Review package: cd0b6b0..774e416
+
+## Commits
+774e416 feat(config): add rate-limit hardening knobs
+b052591 feat(ratelimit): add soft-block detection + SoftBlockError
+142cc4b feat(ratelimit): add RequestBudget with hard cap
+f5118ac feat(ratelimit): add global RateLimiter with injectable clock
+
+## Files changed
+ modules/config.py       |  7 +++++
+ modules/ratelimit.py    | 72 +++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_config.py    |  9 ++++++
+ tests/test_ratelimit.py | 75 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 163 insertions(+)
+
+## Diff
+diff --git a/modules/config.py b/modules/config.py
+index 60577c5..5a60065 100644
+--- a/modules/config.py
++++ b/modules/config.py
+@@ -12,10 +12,17 @@ os.makedirs(DATA_DIR, exist_ok=True)
+ os.makedirs(RESULTS_DIR, exist_ok=True)
+ 
+ COOKIE_STRING = ''
+ 
+ MODEL_NAME = "buffalo_l"
+ SIM_THRESHOLD = 0.35
+ PLAYWRIGHT_TIMEOUT = 15000
+ PAGE_WAIT = 1500
+ WORKERS = 3
+ MAX_DEPTH = 3
++
++# --- Rate-limit hardening ---
++RATE_PER_MIN = 20                 # global read pace (requests/min); 0 disables
++DELAY_RANGE = (1.0, 3.0)          # jittered inter-action delay (seconds)
++MAX_REQUESTS = 800                # per-run request budget; None disables
++MAX_EXPANSIONS_PER_LAYER = 15     # cap accounts expanded per BFS layer; None disables
++BACKOFF_CAP = 300                 # max backoff seconds (was hardcoded 30)
+diff --git a/modules/ratelimit.py b/modules/ratelimit.py
+index 0b330d1..6b5f6fc 100644
+--- a/modules/ratelimit.py
++++ b/modules/ratelimit.py
+@@ -6,10 +6,82 @@ import random
+ def jittered_delay(lo, hi, rng=random):
+     """Random delay in [lo, hi]. Returns 0.0 when lo==hi==0."""
+     if hi <= lo:
+         return float(lo)
+     return rng.uniform(lo, hi)
+ 
+ 
+ def backoff_delay(attempt, base=2.0, cap=300.0, rng=random):
+     """Exponential backoff with jitter, capped at `cap` seconds."""
+     return min(base ** attempt + rng.uniform(0, 1), cap)
++
++
++class RateLimiter:
++    """Global pacer: serializes acquire() so requests are >= min_interval apart."""
++
++    def __init__(self, rate_per_min, jitter_range=(0.0, 0.0), time_fn=None, sleep_fn=None):
++        self.min_interval = (60.0 / rate_per_min) if rate_per_min and rate_per_min > 0 else 0.0
++        self.jitter_range = jitter_range
++        self._time = time_fn or (lambda: asyncio.get_event_loop().time())
++        self._sleep = sleep_fn or asyncio.sleep
++        self._lock = asyncio.Lock()
++        self._next_allowed = 0.0
++
++    async def acquire(self):
++        if self.min_interval <= 0.0:
++            return
++        async with self._lock:
++            now = self._time()
++            wait = self._next_allowed - now
++            if wait > 0:
++                await self._sleep(wait)
++            extra = jittered_delay(*self.jitter_range)
++            self._next_allowed = self._time() + self.min_interval + extra
++
++
++class BudgetExceeded(Exception):
++    def __init__(self, spent, limit):
++        self.spent = spent
++        self.limit = limit
++        super().__init__(f"request budget exceeded: {spent} > {limit}")
++
++
++class RequestBudget:
++    """Counts total requests spent across the run; raises when over max_requests."""
++
++    def __init__(self, max_requests=None):
++        self.max_requests = max_requests
++        self.spent = 0
++        self._lock = asyncio.Lock()
++
++    async def spend(self, n=1):
++        async with self._lock:
++            self.spent += n
++            if self.max_requests is not None and self.spent > self.max_requests:
++                raise BudgetExceeded(self.spent, self.max_requests)
++
++
++class SoftBlockError(Exception):
++    def __init__(self, kind, detail=""):
++        self.kind = kind
++        super().__init__(("soft-block: %s %s" % (kind, detail)).strip())
++
++
++_BODY_MARKERS = [
++    ("checkpoint", "checkpoint_required"),
++    ("challenge", "challenge_required"),
++    ("feedback_required", "feedback_required"),
++]
++
++
++def detect_soft_block(status, url, body_text):
++    """Detect account-level soft blocks. 429 (throttle) is intentionally NOT one."""
++    if status == 429:
++        return None
++    if url and "/accounts/login" in url:
++        return "login_redirect"
++    if body_text:
++        low = body_text.lower()
++        for kind, marker in _BODY_MARKERS:
++            if marker in low:
++                return kind
++    return None
+diff --git a/tests/test_config.py b/tests/test_config.py
+new file mode 100644
+index 0000000..c5da33c
+--- /dev/null
++++ b/tests/test_config.py
+@@ -0,0 +1,9 @@
++from modules import config
++
++
++def test_hardening_defaults_exist():
++    assert config.RATE_PER_MIN == 20
++    assert config.DELAY_RANGE == (1.0, 3.0)
++    assert config.MAX_REQUESTS == 800
++    assert config.MAX_EXPANSIONS_PER_LAYER == 15
++    assert config.BACKOFF_CAP == 300
+diff --git a/tests/test_ratelimit.py b/tests/test_ratelimit.py
+index c9db8c2..52c4da7 100644
+--- a/tests/test_ratelimit.py
++++ b/tests/test_ratelimit.py
+@@ -11,10 +11,85 @@ def test_jittered_delay_within_bounds():
+ 
+ def test_jittered_delay_zero_range():
+     assert jittered_delay(0.0, 0.0) == 0.0
+ 
+ 
+ def test_backoff_delay_grows_and_caps():
+     seq = [backoff_delay(a, base=2.0, cap=300.0, rng=random.Random(1)) for a in range(12)]
+     assert seq[0] < seq[3] < seq[6]         # grows
+     assert all(d <= 300.0 for d in seq)     # capped
+     assert seq[-1] == 300.0                  # deep attempt saturates cap
++
++
++import pytest
++from modules.ratelimit import RateLimiter
++
++
++async def test_rate_limiter_spaces_calls():
++    clock = {"t": 0.0}
++    slept = []
++
++    def time_fn():
++        return clock["t"]
++
++    async def sleep_fn(d):
++        slept.append(d)
++        clock["t"] += d          # advance virtual clock
++
++    rl = RateLimiter(rate_per_min=60, time_fn=time_fn, sleep_fn=sleep_fn)  # min_interval=1.0s
++    await rl.acquire()           # first: no wait
++    await rl.acquire()           # second: must wait ~1.0s
++    assert slept and abs(slept[-1] - 1.0) < 1e-6
++
++
++async def test_rate_limiter_disabled():
++    slept = []
++
++    async def sleep_fn(d):
++        slept.append(d)
++
++    rl = RateLimiter(rate_per_min=0, sleep_fn=sleep_fn)
++    await rl.acquire()
++    await rl.acquire()
++    assert slept == []           # disabled => never sleeps
++
++
++from modules.ratelimit import RequestBudget, BudgetExceeded
++
++
++async def test_budget_counts_and_raises():
++    b = RequestBudget(max_requests=3)
++    await b.spend()          # 1
++    await b.spend(2)         # 3 (== limit, still OK)
++    assert b.spent == 3
++    with pytest.raises(BudgetExceeded) as ei:
++        await b.spend()      # 4 > 3
++    assert ei.value.limit == 3
++    assert ei.value.spent == 4
++
++
++async def test_budget_unlimited_when_none():
++    b = RequestBudget(max_requests=None)
++    for _ in range(1000):
++        await b.spend()
++    assert b.spent == 1000
++
++
++from modules.ratelimit import detect_soft_block, SoftBlockError
++
++
++def test_detect_login_redirect():
++    assert detect_soft_block(200, "https://www.instagram.com/accounts/login/?next=/x/", "") == "login_redirect"
++
++
++def test_detect_body_markers():
++    assert detect_soft_block(400, "https://www.instagram.com/x/", '{"message":"checkpoint_required"}') == "checkpoint"
++    assert detect_soft_block(400, "u", '{"message":"challenge_required"}') == "challenge"
++    assert detect_soft_block(400, "u", '{"message":"feedback_required"}') == "feedback_required"
++
++
++def test_429_is_not_soft_block():
++    assert detect_soft_block(429, "https://www.instagram.com/x/", "rate limited") is None
++
++
++def test_clean_response_is_none():
++    assert detect_soft_block(200, "https://www.instagram.com/x/", '{"data":{"user":{}}}') is None

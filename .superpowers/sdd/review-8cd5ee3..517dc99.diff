@@ -1,0 +1,392 @@
+# Review package: 8cd5ee3..517dc99
+
+## Commits
+517dc99 feat(cli): expose rate/budget/expand/delay flags + document
+
+## Files changed
+ docs/keamanan-dan-rate-limit.md |  98 +++++++++++++++++++++++++++
+ docs/penggunaan.md              | 145 ++++++++++++++++++++++++++++++++++++++++
+ face-osint                      |  30 ++++++++-
+ 3 files changed, 272 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/docs/keamanan-dan-rate-limit.md b/docs/keamanan-dan-rate-limit.md
+new file mode 100644
+index 0000000..7cfadcc
+--- /dev/null
++++ b/docs/keamanan-dan-rate-limit.md
+@@ -0,0 +1,98 @@
++# Keamanan & Rate-Limit
++
++## TL;DR — tool ini TIDAK aman dari rate-limit
++
++face-osint sangat terekspos rate-limit dan ban Instagram. Traversal follower-graph secara bulk dari satu session yang login adalah **persis pola yang di-flag Instagram sebagai bot**. Kodenya sendiri sudah berasumsi rate-limit pasti kena (ada exponential backoff + peringatan di README).
++
++**Jangan pernah menjalankan tool ini dengan akun Instagram pribadi/utama.**
++
++## "Pakai Playwright" ≠ "aman dari rate-limit"
++
++Project ini memang sudah memakai Playwright (browser asli). Itu menyelesaikan **satu** lapisan deteksi saja. Instagram mendeteksi di tiga lapisan:
++
++| Lapisan | Playwright menolong? | Alasan |
++|---|---|---|
++| **Transport / fingerprint** (TLS/JA3, urutan header) | ✅ Ya | Browser asli = handshake asli. Ini yang membuat client HTTP Python (`requests`/`httpx`) diblok instan. Playwright lolos. |
++| **IP** (reputasi, ASN, volume) | ❌ Tidak | Semua traffic tetap keluar dari satu IP. Datacenter IP diblok di request pertama; IP rumah kena throttle saat volume tinggi. |
++| **Akun / perilaku** (trust-score, pola baca) | ❌ Tidak | Ini pembunuh sebenarnya. Enumerasi follower-list linier lintas banyak node = pola bot. Yang kena flag adalah `sessionid`-mu, bukan browsernya. |
++
++**Rate-limit itu berbasis perilaku + akun + IP, bukan berbasis alat.** Playwright mengangkat kualitas transport ke level browser asli (itu sebabnya arsitektur ini "benar"), tapi tidak menyentuh sama sekali risiko trust-akun.
++
++## Model volume request
++
++Per akun yang **dicek**: konteks browser baru + navigasi ke `/` + XHR `web_profile_info` + fetch gambar ≈ **3 request/akun**. Per akun yang **di-expand**: ~2 navigasi + puluhan XHR list.
++
++Dengan followers cap 100, following cap 500, workers 3:
++
++| Depth | Estimasi request | Kenapa |
++|---|---|---|
++| **1** | **~10³** | Hanya layer-0; Phase 2 di-skip (`search.py`, `depth <= 1`). |
++| **2** | **~10⁵** | **Setiap akun non-match di-expand** — fan-out ~600/akun. |
++| **3** | **~10⁶–10⁷** | Dua generasi expansion, tanpa cap dan tanpa budget. Praktis unbounded. |
++
++Instagram meng-action-block klien tidak resmi jauh di bawah ~1.000 hit profil/graph per hari. **Bahkan depth 1 sudah melewati garis aman; depth 2–3 katastrofik.**
++
++## Mitigasi yang sudah ada
++
++Sejak rate-limit hardening (`modules/ratelimit.py`, wired ke `instagram.py`/`search.py`/CLI), tool ini punya pertahanan di **laju** dan **berhenti otomatis**, bukan cuma pengurangan jumlah:
++
++- **Global rate limiter** (`RateLimiter`, flag `--rate`, default 20 req/menit, `0`=mati) — memaksa jarak minimum antar-request di seluruh run, bukan cuma per-worker.
++- **Jitter delay acak** (`jittered_delay`, flag `--delay-min`/`--delay-max`, default 1.0–3.0s) — menggantikan delay fixed lama; laju tidak lagi teratur secara mencolok.
++- **Deteksi soft-block + hard-stop** (`detect_soft_block`/`SoftBlockError`) — login-redirect, `checkpoint_required`, `challenge_required`, `feedback_required` di body langsung menghentikan search (tidak retry-loop). Muncul di CLI sebagai `STOPPED early (safety): ...`.
++- **Request budget per-run** (`RequestBudget`, flag `--max-requests`, default 800) — search berhenti otomatis begitu total request lintas semua worker melampaui budget.
++- **Expansion cap per layer** (`cap_expansions`, flag `--max-expand`, default 15) — fan-out BFS di-cap per layer, bukan lagi unbounded.
++- **Adaptive backoff cap 300s** (`backoff_delay`, `config.BACKOFF_CAP`) pada 429 — naik dari cap 30s lama yang terlalu rendah untuk cooldown IG (bisa menit–jam).
++- Cache disk followers/following + `--no-cache` untuk memaksa re-scrape.
++- Set dedup `checked_users` / `checked_urls` / `expanded_users`.
++- Early-stop saat match (cancel semua task in-flight).
++- `skip_home` di jalur hot.
++- Page-size 50 (minimum jumlah request untuk list tertentu).
++
++Catatan: default `--rate`/`--max-requests`/`--max-expand` mengurangi risiko secara signifikan dibanding sebelum hardening, tapi **tidak menghilangkan** risiko ban — lihat "Faktor risiko" dan "Playbook" di bawah untuk apa yang masih harus dilakukan manual (akun burner, IP residensial, dst).
++
++## Faktor risiko (kritis)
++
++- **Single sessionid/cookie** untuk seluruh burst — satu identitas menyerap semua traffic. *(belum dimitigasi — di luar scope hardening ini; butuh multi-akun/proxy, lihat playbook)*
++- **Tanpa proxy / IP rotation** di mana pun. *(belum dimitigasi — deferred, lihat "Known limitation" di bawah)*
++- **Global adaptive backoff belum cross-worker** — tiap worker mundur sendiri-sendiri saat 429; belum ada jeda bersama lintas-worker (deferred, scope B).
++- Dead code `_api_followers`/`_api_following`; knob `PAGE_WAIT` didefinisikan tapi tak dipakai.
++
++~~BFS expansion unbounded~~, ~~delay fixed~~, dan ~~hanya HTTP 429 dianggap throttle~~ — **sudah diperbaiki** oleh expansion cap, jitter delay, dan `detect_soft_block` di atas.
++
++## Realita Instagram (2024–2026)
++
++> Instagram/Meta tidak mem-publish angka resmi untuk private endpoint ini. Angka di bawah = observasi vendor / kode library / laporan komunitas. Arahnya high-confidence walau angkanya perkiraan.
++
++- Throttling saat login = gabungan **akun + session + IP**, bukan satu sumbu.
++- **Enumerasi daftar follower/following = read dengan toleransi paling rendah.** Pola BFS tool ini menghantam persis endpoint itu.
++- Meta **secara resmi men-disable akun** karena scraping ("disabling accounts… blocked billions of suspected unauthorized scraping actions per day").
++- Laporan first-person: ban setelah **~20–47 profil** di beberapa kasus; enumerasi ~110k follower → checkpoint + paksa reset password.
++- Escalation umum: `429 ClientThrottledError` → `PleaseWaitFewMinutes` → `feedback_required` (cooldown 24–72 jam) → `challenge_required`/`checkpoint_required` (verifikasi/reset) → disable.
++- Putusan *Meta v. Bright Data* (2024) hanya melindungi scraping **logged-out** yang publik — tool ini logged-in, **tidak** terlindungi.
++
++**Sumber utama:**
++
++- OFFICIAL — Meta: <https://www.meta.com/actions/privacy-progress/>
++- CREDIBLE — HikerAPI (limit per-endpoint, ekonomi burner): <https://hikerapi.com/help/instagram-scraping-without-getting-blocked>
++- CREDIBLE — Scrapfly (threshold, fingerprint): <https://scrapfly.io/blog/posts/how-to-scrape-instagram>
++- COMMUNITY — instaloader #2512 (ban dari enumerasi follower): <https://github.com/instaloader/instaloader/issues/2512>
++
++## Playbook pakai (se-)aman(-mungkin)
++
++Kalau tool ini tetap harus dijalankan:
++
++1. **Akun burner khusus** — jangan akun pribadi/utama. Anggap barang habis pakai (vendor melaporkan 5–15% kehilangan akun/minggu bahkan saat hati-hati). *(manual — di luar scope tool)*
++2. **IP residensial per akun** — bukan datacenter IP (diblok request pertama). Jangan berbagi satu IP untuk banyak akun ("chain ban"). *(manual — belum ada dukungan proxy di tool)*
++3. **Delay acak 1–3s+** antar aksi, bukan delay fixed. ✅ **Sudah default** (`--delay-min`/`--delay-max`, default 1.0–3.0s) + global pacing `--rate` (default 20/menit).
++4. **Budget < ~150 read/jam**, dijauhkan dari paginasi follower-list; jalankan dengan jeda (bukan kontinu). Sebagian termitigasi oleh `--max-requests` (default 800/run) — tapi itu budget per-run, bukan per-jam; tetap atur jeda antar-run secara manual.
++5. **Hard-stop pada `PleaseWaitFewMinutes` / `feedback_required`** — jangan retry-loop. ✅ **Sudah default**: `detect_soft_block` + `SoftBlockError` menghentikan search seketika (`STOPPED early (safety): ...`), tidak pernah retry-loop menembus soft-block.
++6. **Batasi jumlah expansion per layer** dan hindari `--depth` tinggi. ✅ **Sudah default** (`--max-expand`, default 15/layer). Depth 1 saja tetap paling aman — cap ini mengurangi fan-out di depth ≥2, bukan menghilangkan risikonya.
++7. **Pertahankan Playwright** — transport browser asli menghindari blok instan berbasis fingerprint (satu-satunya keunggulan yang sudah dimiliki tool ini). Jangan turunkan ke raw HTTP. *(tidak berubah — tetap wajib)*
++
++## Etika & legal
++
++Tool ini melakukan **scraping** (melanggar ToU Instagram) dan **face-recognition terhadap orang tanpa consent**. Konsekuensi hukum, privasi, dan etika sepenuhnya menjadi tanggung jawab pemakai. Gunakan hanya dalam konteks yang sah dan berizin.
++
++---
++
++*Ringkasan riset ini berasal dari investigasi multi-agent 2026-07-10 (kode + riset eksternal). Catatan tersimpan di memory project `rate-limit-analysis`.*
+diff --git a/docs/penggunaan.md b/docs/penggunaan.md
+new file mode 100644
+index 0000000..a72a1fe
+--- /dev/null
++++ b/docs/penggunaan.md
+@@ -0,0 +1,145 @@
++# Penggunaan
++
++Semua command dijalankan lewat script `face-osint`. Flag cookie global (jika dipakai) diletakkan **sebelum** subcommand — lihat [instalasi.md](instalasi.md).
++
++```
++./face-osint <command> [args] [options]
++```
++
++| Command | Fungsi |
++|---|---|
++| `compare` | Bandingkan dua gambar wajah (cosine similarity) |
++| `pic` | Download foto profil sebuah username |
++| `scrape` | Simpan daftar followers/following ke JSON |
++| `search` | Face search BFS (inti tool) |
++| `list` | Tampilkan hasil search yang tersimpan |
++
++---
++
++## `compare` — bandingkan dua wajah
++
++```bash
++./face-osint compare ref.jpg target.jpg
++```
++
++Output:
++
++```
++  Reference: ref.jpg
++  Target:    target.jpg
++  Similarity: 44.65%
++  Threshold:  35%
++  Match:      YES
++```
++
++Tidak butuh cookie/jaringan. Kalau salah satu gambar tidak mengandung wajah yang terdeteksi, keluar dengan error "No face detected".
++
++---
++
++## `pic` — download foto profil
++
++```bash
++./face-osint pic <username>
++./face-osint --cookie "sessionid=..." pic <username>
++```
++
++Foto tersimpan di `modules/data/<username>_profile.jpg` (lihat catatan lokasi output di bawah).
++
++---
++
++## `scrape` — followers/following
++
++```bash
++./face-osint scrape <username>
++```
++
++Tersimpan sebagai:
++
++- `modules/data/<username>_followers.json`
++- `modules/data/<username>_following.json`
++
++Scraping dilakukan dengan men-scroll modal followers/following di halaman (via Playwright), dengan cap **100 followers / 500 following**. Kalau kena rate-limit, tunggu atau ganti session.
++
++---
++
++## `search` — face search BFS (inti)
++
++```bash
++./face-osint search <ref_image> <username> [options]
++```
++
++### Opsi
++
++| Opsi | Default | Keterangan |
++|---|---|---|
++| `--depth N` | `1` | Kedalaman graph. 1 = followers/following target; 2 = plus teman-temannya; dst. |
++| `--workers N` | `3` | Jumlah worker paralel untuk face comparison |
++| `--threshold X` | `0.35` | Ambang kemiripan 0–1 (**lihat jebakan di bawah**) |
++| `--no-cache` | — | Abaikan cache, scrape ulang followers/following |
++| `--rate N` | `20` | Global read pace, request/menit. `0` = mati (tanpa pacing) |
++| `--max-requests N` | `800` | Budget request per-run. Search berhenti otomatis (`STOPPED early`) begitu terlampaui |
++| `--max-expand N` | `15` | Maksimum akun yang di-expand per layer BFS (cap fan-out) |
++| `--delay-min X` / `--delay-max X` | `1.0` / `3.0` | Rentang delay jitter (detik) antar aksi, di atas pacing `--rate` |
++
++### Contoh
++
++```bash
++# Depth 1 — cek followers/following target saja
++./face-osint search ref.jpg target --depth 1 --workers 4
++
++# Depth 2 — plus followers/following dari akun non-match
++./face-osint search ref.jpg target --depth 2
++
++# Dengan cookie custom
++./face-osint --cookie "sessionid=..." search ref.jpg target --depth 2
++
++# Dengan rate-limit hardening custom (pace lebih pelan, budget lebih kecil)
++./face-osint search ref.jpg target --depth 1 --rate 10 --max-requests 300 --max-expand 5
++```
++
++Saat sebuah akun mencapai ambang match, proses **berhenti otomatis**:
++
++```
++  FOUND! @username  |  40.89%
++  https://instagram.com/username
++```
++
++Proses juga bisa **berhenti otomatis demi keamanan** (bukan karena match) kalau budget request habis atau Instagram mengembalikan soft-block (checkpoint/challenge/login-redirect). Dalam kasus ini tidak ada retry-loop — search langsung berhenti dan mencetak:
++
++```
++  STOPPED early (safety): request budget exceeded: 801 > 800
++```
++
++> ⚠️ **Baca [keamanan-dan-rate-limit.md](keamanan-dan-rate-limit.md) sebelum memakai `--depth 2` atau lebih.** Volume request meledak secara eksponensial dan hampir pasti berujung ban akun. `--rate`/`--max-requests`/`--max-expand` mengurangi risiko tapi tidak menghilangkannya.
++
++### ⚠️ Jebakan: `--threshold` tidak menghentikan search
++
++Nilai `--threshold` di CLI **hanya** memengaruhi print summary dan marker `<<<` pada output. Yang benar-benar menghentikan pencarian saat match adalah konstanta `config.SIM_THRESHOLD` (default `0.35`).
++
++Untuk mengubah cutoff match yang sebenarnya, ubah `config.SIM_THRESHOLD` di `modules/config.py` (atau wire nilai CLI ke `BFSSearch`).
++
++---
++
++## `list` — lihat hasil search
++
++```bash
++./face-osint list
++./face-osint list path/ke/face_search_result.json
++```
++
++Tanpa argumen, membaca `modules/results/face_search_result.json`. Menampilkan total akun dicek, jumlah wajah terdeteksi, status match, dan top matches.
++
++---
++
++## Catatan lokasi output (penting)
++
++`config.py` menghitung `DATA_DIR` dan `RESULTS_DIR` relatif terhadap folder **`modules/`**, jadi output nyata mendarat di:
++
++- `modules/data/` — cache followers/following + foto profil
++- `modules/results/` — `face_search_result.json`
++
++**Bukan** `data/`/`results/` di root repo. Keduanya di-gitignore. Ingat ini saat mencari file cache/hasil.
++
++## Caching
++
++`search` memakai ulang `<username>_followers.json` / `<username>_following.json` dari `modules/data/` kecuali `--no-cache` diberikan. Di dalam satu run, set `checked_users` / `checked_urls` / `expanded_users` mencegah pengecekan ulang akun antar-depth.
+diff --git a/face-osint b/face-osint
+index f803c1a..ee1229a 100755
+--- a/face-osint
++++ b/face-osint
+@@ -35,20 +35,21 @@ Other examples:
+ """
+ import sys, os, json, time, cv2, numpy as np, asyncio
+ from numpy.linalg import norm
+ 
+ BASE = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, BASE)
+ 
+ from modules.instagram import Instagram, close_shared_browser
+ from modules.face import FaceEngine
+ from modules.search import BFSSearch
++from modules.ratelimit import RateLimiter, RequestBudget
+ from modules import config
+ 
+ def resolve_cookie():
+     if hasattr(resolve_cookie, "_cached"):
+         return resolve_cookie._cached
+ 
+     raw = None
+ 
+     for i, arg in enumerate(sys.argv):
+         if arg == "--cookies" and i + 1 < len(sys.argv):
+@@ -145,44 +146,62 @@ async def _scrape_user(username, cookie):
+     return followers, following
+ 
+ async def cmd_search(args):
+     if len(args) < 2:
+         print("Usage: face-osint search <ref_image> <instagram_username> [options]")
+         print("Options:")
+         print("  --depth N     Graph depth (0=user only, 1=followers/following, 2=their friends, ...)")
+         print("  --workers N   Parallel workers (default 3)")
+         print("  --threshold X Match threshold 0-1 (default 0.35)")
+         print("  --no-cache    Re-scrape followers/following, ignore saved cache")
++        print("  --rate N        Global read pace, requests/min (default 20; 0=off)")
++        print("  --max-requests N  Per-run request budget (default 800)")
++        print("  --max-expand N  Max accounts expanded per layer (default 15)")
++        print("  --delay-min X / --delay-max X  Jittered inter-action delay seconds")
+         print("")
+         print("Examples:")
+         print("  face-osint search ref.jpg target_user --depth 1")
+         print("  face-osint search ref.jpg target_user --depth 3 --workers 5")
+         return 1
+     ref_path = args[0]
+     username = args[1]
+     cookie = resolve_cookie()
+ 
+     workers = config.WORKERS
+     threshold = config.SIM_THRESHOLD
+     depth = 1
+     no_cache = False
++    rate = config.RATE_PER_MIN
++    max_requests = config.MAX_REQUESTS
++    max_expand = config.MAX_EXPANSIONS_PER_LAYER
++    delay_min, delay_max = config.DELAY_RANGE
+ 
+     i = 2
+     while i < len(args):
+         if args[i] == "--workers" and i + 1 < len(args):
+             workers = int(args[i + 1]); i += 2
+         elif args[i] == "--threshold" and i + 1 < len(args):
+             threshold = float(args[i + 1]); i += 2
+         elif args[i] == "--depth" and i + 1 < len(args):
+             depth = int(args[i + 1]); i += 2
+         elif args[i] == "--no-cache":
+             no_cache = True; i += 1
++        elif args[i] == "--rate" and i + 1 < len(args):
++            rate = int(args[i + 1]); i += 2
++        elif args[i] == "--max-requests" and i + 1 < len(args):
++            max_requests = int(args[i + 1]); i += 2
++        elif args[i] == "--max-expand" and i + 1 < len(args):
++            max_expand = int(args[i + 1]); i += 2
++        elif args[i] == "--delay-min" and i + 1 < len(args):
++            delay_min = float(args[i + 1]); i += 2
++        elif args[i] == "--delay-max" and i + 1 < len(args):
++            delay_max = float(args[i + 1]); i += 2
+         else:
+             i += 1
+ 
+     if not os.path.exists(ref_path):
+         print(f"Error: Reference image not found: {ref_path}")
+         return 1
+ 
+     print("Initializing face engine...")
+     engine = FaceEngine()
+     ref_emb = engine.get_embedding_from_path(ref_path)
+@@ -212,25 +231,34 @@ async def cmd_search(args):
+         followers, following = await _scrape_user(username, cookie)
+     else:
+         followers = json.load(open(followers_path))
+         following = json.load(open(following_path))
+         print(f"  Loaded {len(followers)} followers, {len(following)} following from cache")
+ 
+     layer0 = list(dict.fromkeys(followers + following))
+     print(f"\nLayer 0: {len(layer0)} unique accounts")
+     print(f"Searching with {workers} parallel workers...")
+ 
+-    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers, face_engine=engine, ref_emb=ref_emb)
++    limiter = RateLimiter(rate, jitter_range=(delay_min, delay_max))
++    budget = RequestBudget(max_requests)
++    config.MAX_EXPANSIONS_PER_LAYER = max_expand   # honor CLI override
++
++    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers,
++                         face_engine=engine, ref_emb=ref_emb,
++                         rate_limiter=limiter, budget=budget)
+     t0 = time.time()
+     results = await searcher.search(layer0, depth=depth)
+     elapsed = time.time() - t0
+ 
++    if searcher.stop_reason:
++        print(f"\n  STOPPED early (safety): {searcher.stop_reason}")
++
+     print(f"\nDone in {elapsed:.0f}s")
+     print(f"Faces detected: {len(searcher.results)}")
+ 
+     top = searcher.get_top(20)
+     print(f"\nTop 20:")
+     for u, s in top:
+         mark = " <<<" if s >= threshold else ""
+         print(f"  @{u}: {s*100:.1f}%{mark}")
+ 
+     if searcher.found_data[0]:

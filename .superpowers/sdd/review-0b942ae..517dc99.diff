@@ -1,0 +1,1073 @@
+# Review package: 0b942ae27b10507509e57a0ce1a72bdcf2d815a9..517dc99
+
+## Commits
+517dc99 feat(cli): expose rate/budget/expand/delay flags + document
+8cd5ee3 feat(search): cap expansions per layer + graceful stop on soft-block/budget
+bac9dc0 feat(instagram): pace requests, jitter delays, detect soft-blocks (Playwright)
+774e416 feat(config): add rate-limit hardening knobs
+b052591 feat(ratelimit): add soft-block detection + SoftBlockError
+142cc4b feat(ratelimit): add RequestBudget with hard cap
+f5118ac feat(ratelimit): add global RateLimiter with injectable clock
+cd0b6b0 feat(ratelimit): add pure jitter+backoff helpers with tests
+
+## Files changed
+ docs/keamanan-dan-rate-limit.md   |  98 ++++++++++++++++++++++++++
+ docs/penggunaan.md                | 145 ++++++++++++++++++++++++++++++++++++++
+ face-osint                        |  30 +++++++-
+ modules/config.py                 |   7 ++
+ modules/instagram.py              |  34 +++++++--
+ modules/ratelimit.py              |  87 +++++++++++++++++++++++
+ modules/search.py                 |  34 ++++++++-
+ pytest.ini                        |   3 +
+ requirements-dev.txt              |   2 +
+ tests/__init__.py                 |   0
+ tests/conftest.py                 |   5 ++
+ tests/test_config.py              |   9 +++
+ tests/test_instagram_softblock.py |  33 +++++++++
+ tests/test_ratelimit.py           |  95 +++++++++++++++++++++++++
+ tests/test_search_limits.py       |  12 ++++
+ 15 files changed, 584 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/docs/keamanan-dan-rate-limit.md b/docs/keamanan-dan-rate-limit.md
+new file mode 100644
+index 0000000..7cfadcc
+--- /dev/null
++++ b/docs/keamanan-dan-rate-limit.md
+@@ -0,0 +1,98 @@
++# Keamanan & Rate-Limit
++
++## TL;DR — tool ini TIDAK aman dari rate-limit
++
++face-osint sangat terekspos rate-limit dan ban Instagram. Traversal follower-graph secara bulk dari satu session yang login adalah **persis pola yang di-flag Instagram sebagai bot**. Kodenya sendiri sudah berasumsi rate-limit pasti kena (ada exponential backoff + peringatan di README).
++
++**Jangan pernah menjalankan tool ini dengan akun Instagram pribadi/utama.**
++
++## "Pakai Playwright" ≠ "aman dari rate-limit"
++
++Project ini memang sudah memakai Playwright (browser asli). Itu menyelesaikan **satu** lapisan deteksi saja. Instagram mendeteksi di tiga lapisan:
++
++| Lapisan | Playwright menolong? | Alasan |
++|---|---|---|
++| **Transport / fingerprint** (TLS/JA3, urutan header) | ✅ Ya | Browser asli = handshake asli. Ini yang membuat client HTTP Python (`requests`/`httpx`) diblok instan. Playwright lolos. |
++| **IP** (reputasi, ASN, volume) | ❌ Tidak | Semua traffic tetap keluar dari satu IP. Datacenter IP diblok di request pertama; IP rumah kena throttle saat volume tinggi. |
++| **Akun / perilaku** (trust-score, pola baca) | ❌ Tidak | Ini pembunuh sebenarnya. Enumerasi follower-list linier lintas banyak node = pola bot. Yang kena flag adalah `sessionid`-mu, bukan browsernya. |
++
++**Rate-limit itu berbasis perilaku + akun + IP, bukan berbasis alat.** Playwright mengangkat kualitas transport ke level browser asli (itu sebabnya arsitektur ini "benar"), tapi tidak menyentuh sama sekali risiko trust-akun.
++
++## Model volume request
++
++Per akun yang **dicek**: konteks browser baru + navigasi ke `/` + XHR `web_profile_info` + fetch gambar ≈ **3 request/akun**. Per akun yang **di-expand**: ~2 navigasi + puluhan XHR list.
++
++Dengan followers cap 100, following cap 500, workers 3:
++
++| Depth | Estimasi request | Kenapa |
++|---|---|---|
++| **1** | **~10³** | Hanya layer-0; Phase 2 di-skip (`search.py`, `depth <= 1`). |
++| **2** | **~10⁵** | **Setiap akun non-match di-expand** — fan-out ~600/akun. |
++| **3** | **~10⁶–10⁷** | Dua generasi expansion, tanpa cap dan tanpa budget. Praktis unbounded. |
++
++Instagram meng-action-block klien tidak resmi jauh di bawah ~1.000 hit profil/graph per hari. **Bahkan depth 1 sudah melewati garis aman; depth 2–3 katastrofik.**
++
++## Mitigasi yang sudah ada
++
++Sejak rate-limit hardening (`modules/ratelimit.py`, wired ke `instagram.py`/`search.py`/CLI), tool ini punya pertahanan di **laju** dan **berhenti otomatis**, bukan cuma pengurangan jumlah:
++
++- **Global rate limiter** (`RateLimiter`, flag `--rate`, default 20 req/menit, `0`=mati) — memaksa jarak minimum antar-request di seluruh run, bukan cuma per-worker.
++- **Jitter delay acak** (`jittered_delay`, flag `--delay-min`/`--delay-max`, default 1.0–3.0s) — menggantikan delay fixed lama; laju tidak lagi teratur secara mencolok.
++- **Deteksi soft-block + hard-stop** (`detect_soft_block`/`SoftBlockError`) — login-redirect, `checkpoint_required`, `challenge_required`, `feedback_required` di body langsung menghentikan search (tidak retry-loop). Muncul di CLI sebagai `STOPPED early (safety): ...`.
++- **Request budget per-run** (`RequestBudget`, flag `--max-requests`, default 800) — search berhenti otomatis begitu total request lintas semua worker melampaui budget.
++- **Expansion cap per layer** (`cap_expansions`, flag `--max-expand`, default 15) — fan-out BFS di-cap per layer, bukan lagi unbounded.
++- **Adaptive backoff cap 300s** (`backoff_delay`, `config.BACKOFF_CAP`) pada 429 — naik dari cap 30s lama yang terlalu rendah untuk cooldown IG (bisa menit–jam).
++- Cache disk followers/following + `--no-cache` untuk memaksa re-scrape.
++- Set dedup `checked_users` / `checked_urls` / `expanded_users`.
++- Early-stop saat match (cancel semua task in-flight).
++- `skip_home` di jalur hot.
++- Page-size 50 (minimum jumlah request untuk list tertentu).
++
++Catatan: default `--rate`/`--max-requests`/`--max-expand` mengurangi risiko secara signifikan dibanding sebelum hardening, tapi **tidak menghilangkan** risiko ban — lihat "Faktor risiko" dan "Playbook" di bawah untuk apa yang masih harus dilakukan manual (akun burner, IP residensial, dst).
++
++## Faktor risiko (kritis)
++
++- **Single sessionid/cookie** untuk seluruh burst — satu identitas menyerap semua traffic. *(belum dimitigasi — di luar scope hardening ini; butuh multi-akun/proxy, lihat playbook)*
++- **Tanpa proxy / IP rotation** di mana pun. *(belum dimitigasi — deferred, lihat "Known limitation" di bawah)*
++- **Global adaptive backoff belum cross-worker** — tiap worker mundur sendiri-sendiri saat 429; belum ada jeda bersama lintas-worker (deferred, scope B).
++- Dead code `_api_followers`/`_api_following`; knob `PAGE_WAIT` didefinisikan tapi tak dipakai.
++
++~~BFS expansion unbounded~~, ~~delay fixed~~, dan ~~hanya HTTP 429 dianggap throttle~~ — **sudah diperbaiki** oleh expansion cap, jitter delay, dan `detect_soft_block` di atas.
++
++## Realita Instagram (2024–2026)
++
++> Instagram/Meta tidak mem-publish angka resmi untuk private endpoint ini. Angka di bawah = observasi vendor / kode library / laporan komunitas. Arahnya high-confidence walau angkanya perkiraan.
++
++- Throttling saat login = gabungan **akun + session + IP**, bukan satu sumbu.
++- **Enumerasi daftar follower/following = read dengan toleransi paling rendah.** Pola BFS tool ini menghantam persis endpoint itu.
++- Meta **secara resmi men-disable akun** karena scraping ("disabling accounts… blocked billions of suspected unauthorized scraping actions per day").
++- Laporan first-person: ban setelah **~20–47 profil** di beberapa kasus; enumerasi ~110k follower → checkpoint + paksa reset password.
++- Escalation umum: `429 ClientThrottledError` → `PleaseWaitFewMinutes` → `feedback_required` (cooldown 24–72 jam) → `challenge_required`/`checkpoint_required` (verifikasi/reset) → disable.
++- Putusan *Meta v. Bright Data* (2024) hanya melindungi scraping **logged-out** yang publik — tool ini logged-in, **tidak** terlindungi.
++
++**Sumber utama:**
++
++- OFFICIAL — Meta: <https://www.meta.com/actions/privacy-progress/>
++- CREDIBLE — HikerAPI (limit per-endpoint, ekonomi burner): <https://hikerapi.com/help/instagram-scraping-without-getting-blocked>
++- CREDIBLE — Scrapfly (threshold, fingerprint): <https://scrapfly.io/blog/posts/how-to-scrape-instagram>
++- COMMUNITY — instaloader #2512 (ban dari enumerasi follower): <https://github.com/instaloader/instaloader/issues/2512>
++
++## Playbook pakai (se-)aman(-mungkin)
++
++Kalau tool ini tetap harus dijalankan:
++
++1. **Akun burner khusus** — jangan akun pribadi/utama. Anggap barang habis pakai (vendor melaporkan 5–15% kehilangan akun/minggu bahkan saat hati-hati). *(manual — di luar scope tool)*
++2. **IP residensial per akun** — bukan datacenter IP (diblok request pertama). Jangan berbagi satu IP untuk banyak akun ("chain ban"). *(manual — belum ada dukungan proxy di tool)*
++3. **Delay acak 1–3s+** antar aksi, bukan delay fixed. ✅ **Sudah default** (`--delay-min`/`--delay-max`, default 1.0–3.0s) + global pacing `--rate` (default 20/menit).
++4. **Budget < ~150 read/jam**, dijauhkan dari paginasi follower-list; jalankan dengan jeda (bukan kontinu). Sebagian termitigasi oleh `--max-requests` (default 800/run) — tapi itu budget per-run, bukan per-jam; tetap atur jeda antar-run secara manual.
++5. **Hard-stop pada `PleaseWaitFewMinutes` / `feedback_required`** — jangan retry-loop. ✅ **Sudah default**: `detect_soft_block` + `SoftBlockError` menghentikan search seketika (`STOPPED early (safety): ...`), tidak pernah retry-loop menembus soft-block.
++6. **Batasi jumlah expansion per layer** dan hindari `--depth` tinggi. ✅ **Sudah default** (`--max-expand`, default 15/layer). Depth 1 saja tetap paling aman — cap ini mengurangi fan-out di depth ≥2, bukan menghilangkan risikonya.
++7. **Pertahankan Playwright** — transport browser asli menghindari blok instan berbasis fingerprint (satu-satunya keunggulan yang sudah dimiliki tool ini). Jangan turunkan ke raw HTTP. *(tidak berubah — tetap wajib)*
++
++## Etika & legal
++
++Tool ini melakukan **scraping** (melanggar ToU Instagram) dan **face-recognition terhadap orang tanpa consent**. Konsekuensi hukum, privasi, dan etika sepenuhnya menjadi tanggung jawab pemakai. Gunakan hanya dalam konteks yang sah dan berizin.
++
++---
++
++*Ringkasan riset ini berasal dari investigasi multi-agent 2026-07-10 (kode + riset eksternal). Catatan tersimpan di memory project `rate-limit-analysis`.*
+diff --git a/docs/penggunaan.md b/docs/penggunaan.md
+new file mode 100644
+index 0000000..a72a1fe
+--- /dev/null
++++ b/docs/penggunaan.md
+@@ -0,0 +1,145 @@
++# Penggunaan
++
++Semua command dijalankan lewat script `face-osint`. Flag cookie global (jika dipakai) diletakkan **sebelum** subcommand — lihat [instalasi.md](instalasi.md).
++
++```
++./face-osint <command> [args] [options]
++```
++
++| Command | Fungsi |
++|---|---|
++| `compare` | Bandingkan dua gambar wajah (cosine similarity) |
++| `pic` | Download foto profil sebuah username |
++| `scrape` | Simpan daftar followers/following ke JSON |
++| `search` | Face search BFS (inti tool) |
++| `list` | Tampilkan hasil search yang tersimpan |
++
++---
++
++## `compare` — bandingkan dua wajah
++
++```bash
++./face-osint compare ref.jpg target.jpg
++```
++
++Output:
++
++```
++  Reference: ref.jpg
++  Target:    target.jpg
++  Similarity: 44.65%
++  Threshold:  35%
++  Match:      YES
++```
++
++Tidak butuh cookie/jaringan. Kalau salah satu gambar tidak mengandung wajah yang terdeteksi, keluar dengan error "No face detected".
++
++---
++
++## `pic` — download foto profil
++
++```bash
++./face-osint pic <username>
++./face-osint --cookie "sessionid=..." pic <username>
++```
++
++Foto tersimpan di `modules/data/<username>_profile.jpg` (lihat catatan lokasi output di bawah).
++
++---
++
++## `scrape` — followers/following
++
++```bash
++./face-osint scrape <username>
++```
++
++Tersimpan sebagai:
++
++- `modules/data/<username>_followers.json`
++- `modules/data/<username>_following.json`
++
++Scraping dilakukan dengan men-scroll modal followers/following di halaman (via Playwright), dengan cap **100 followers / 500 following**. Kalau kena rate-limit, tunggu atau ganti session.
++
++---
++
++## `search` — face search BFS (inti)
++
++```bash
++./face-osint search <ref_image> <username> [options]
++```
++
++### Opsi
++
++| Opsi | Default | Keterangan |
++|---|---|---|
++| `--depth N` | `1` | Kedalaman graph. 1 = followers/following target; 2 = plus teman-temannya; dst. |
++| `--workers N` | `3` | Jumlah worker paralel untuk face comparison |
++| `--threshold X` | `0.35` | Ambang kemiripan 0–1 (**lihat jebakan di bawah**) |
++| `--no-cache` | — | Abaikan cache, scrape ulang followers/following |
++| `--rate N` | `20` | Global read pace, request/menit. `0` = mati (tanpa pacing) |
++| `--max-requests N` | `800` | Budget request per-run. Search berhenti otomatis (`STOPPED early`) begitu terlampaui |
++| `--max-expand N` | `15` | Maksimum akun yang di-expand per layer BFS (cap fan-out) |
++| `--delay-min X` / `--delay-max X` | `1.0` / `3.0` | Rentang delay jitter (detik) antar aksi, di atas pacing `--rate` |
++
++### Contoh
++
++```bash
++# Depth 1 — cek followers/following target saja
++./face-osint search ref.jpg target --depth 1 --workers 4
++
++# Depth 2 — plus followers/following dari akun non-match
++./face-osint search ref.jpg target --depth 2
++
++# Dengan cookie custom
++./face-osint --cookie "sessionid=..." search ref.jpg target --depth 2
++
++# Dengan rate-limit hardening custom (pace lebih pelan, budget lebih kecil)
++./face-osint search ref.jpg target --depth 1 --rate 10 --max-requests 300 --max-expand 5
++```
++
++Saat sebuah akun mencapai ambang match, proses **berhenti otomatis**:
++
++```
++  FOUND! @username  |  40.89%
++  https://instagram.com/username
++```
++
++Proses juga bisa **berhenti otomatis demi keamanan** (bukan karena match) kalau budget request habis atau Instagram mengembalikan soft-block (checkpoint/challenge/login-redirect). Dalam kasus ini tidak ada retry-loop — search langsung berhenti dan mencetak:
++
++```
++  STOPPED early (safety): request budget exceeded: 801 > 800
++```
++
++> ⚠️ **Baca [keamanan-dan-rate-limit.md](keamanan-dan-rate-limit.md) sebelum memakai `--depth 2` atau lebih.** Volume request meledak secara eksponensial dan hampir pasti berujung ban akun. `--rate`/`--max-requests`/`--max-expand` mengurangi risiko tapi tidak menghilangkannya.
++
++### ⚠️ Jebakan: `--threshold` tidak menghentikan search
++
++Nilai `--threshold` di CLI **hanya** memengaruhi print summary dan marker `<<<` pada output. Yang benar-benar menghentikan pencarian saat match adalah konstanta `config.SIM_THRESHOLD` (default `0.35`).
++
++Untuk mengubah cutoff match yang sebenarnya, ubah `config.SIM_THRESHOLD` di `modules/config.py` (atau wire nilai CLI ke `BFSSearch`).
++
++---
++
++## `list` — lihat hasil search
++
++```bash
++./face-osint list
++./face-osint list path/ke/face_search_result.json
++```
++
++Tanpa argumen, membaca `modules/results/face_search_result.json`. Menampilkan total akun dicek, jumlah wajah terdeteksi, status match, dan top matches.
++
++---
++
++## Catatan lokasi output (penting)
++
++`config.py` menghitung `DATA_DIR` dan `RESULTS_DIR` relatif terhadap folder **`modules/`**, jadi output nyata mendarat di:
++
++- `modules/data/` — cache followers/following + foto profil
++- `modules/results/` — `face_search_result.json`
++
++**Bukan** `data/`/`results/` di root repo. Keduanya di-gitignore. Ingat ini saat mencari file cache/hasil.
++
++## Caching
++
++`search` memakai ulang `<username>_followers.json` / `<username>_following.json` dari `modules/data/` kecuali `--no-cache` diberikan. Di dalam satu run, set `checked_users` / `checked_urls` / `expanded_users` mencegah pengecekan ulang akun antar-depth.
+diff --git a/face-osint b/face-osint
+index f803c1a..ee1229a 100755
+--- a/face-osint
++++ b/face-osint
+@@ -35,20 +35,21 @@ Other examples:
+ """
+ import sys, os, json, time, cv2, numpy as np, asyncio
+ from numpy.linalg import norm
+ 
+ BASE = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, BASE)
+ 
+ from modules.instagram import Instagram, close_shared_browser
+ from modules.face import FaceEngine
+ from modules.search import BFSSearch
++from modules.ratelimit import RateLimiter, RequestBudget
+ from modules import config
+ 
+ def resolve_cookie():
+     if hasattr(resolve_cookie, "_cached"):
+         return resolve_cookie._cached
+ 
+     raw = None
+ 
+     for i, arg in enumerate(sys.argv):
+         if arg == "--cookies" and i + 1 < len(sys.argv):
+@@ -145,44 +146,62 @@ async def _scrape_user(username, cookie):
+     return followers, following
+ 
+ async def cmd_search(args):
+     if len(args) < 2:
+         print("Usage: face-osint search <ref_image> <instagram_username> [options]")
+         print("Options:")
+         print("  --depth N     Graph depth (0=user only, 1=followers/following, 2=their friends, ...)")
+         print("  --workers N   Parallel workers (default 3)")
+         print("  --threshold X Match threshold 0-1 (default 0.35)")
+         print("  --no-cache    Re-scrape followers/following, ignore saved cache")
++        print("  --rate N        Global read pace, requests/min (default 20; 0=off)")
++        print("  --max-requests N  Per-run request budget (default 800)")
++        print("  --max-expand N  Max accounts expanded per layer (default 15)")
++        print("  --delay-min X / --delay-max X  Jittered inter-action delay seconds")
+         print("")
+         print("Examples:")
+         print("  face-osint search ref.jpg target_user --depth 1")
+         print("  face-osint search ref.jpg target_user --depth 3 --workers 5")
+         return 1
+     ref_path = args[0]
+     username = args[1]
+     cookie = resolve_cookie()
+ 
+     workers = config.WORKERS
+     threshold = config.SIM_THRESHOLD
+     depth = 1
+     no_cache = False
++    rate = config.RATE_PER_MIN
++    max_requests = config.MAX_REQUESTS
++    max_expand = config.MAX_EXPANSIONS_PER_LAYER
++    delay_min, delay_max = config.DELAY_RANGE
+ 
+     i = 2
+     while i < len(args):
+         if args[i] == "--workers" and i + 1 < len(args):
+             workers = int(args[i + 1]); i += 2
+         elif args[i] == "--threshold" and i + 1 < len(args):
+             threshold = float(args[i + 1]); i += 2
+         elif args[i] == "--depth" and i + 1 < len(args):
+             depth = int(args[i + 1]); i += 2
+         elif args[i] == "--no-cache":
+             no_cache = True; i += 1
++        elif args[i] == "--rate" and i + 1 < len(args):
++            rate = int(args[i + 1]); i += 2
++        elif args[i] == "--max-requests" and i + 1 < len(args):
++            max_requests = int(args[i + 1]); i += 2
++        elif args[i] == "--max-expand" and i + 1 < len(args):
++            max_expand = int(args[i + 1]); i += 2
++        elif args[i] == "--delay-min" and i + 1 < len(args):
++            delay_min = float(args[i + 1]); i += 2
++        elif args[i] == "--delay-max" and i + 1 < len(args):
++            delay_max = float(args[i + 1]); i += 2
+         else:
+             i += 1
+ 
+     if not os.path.exists(ref_path):
+         print(f"Error: Reference image not found: {ref_path}")
+         return 1
+ 
+     print("Initializing face engine...")
+     engine = FaceEngine()
+     ref_emb = engine.get_embedding_from_path(ref_path)
+@@ -212,25 +231,34 @@ async def cmd_search(args):
+         followers, following = await _scrape_user(username, cookie)
+     else:
+         followers = json.load(open(followers_path))
+         following = json.load(open(following_path))
+         print(f"  Loaded {len(followers)} followers, {len(following)} following from cache")
+ 
+     layer0 = list(dict.fromkeys(followers + following))
+     print(f"\nLayer 0: {len(layer0)} unique accounts")
+     print(f"Searching with {workers} parallel workers...")
+ 
+-    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers, face_engine=engine, ref_emb=ref_emb)
++    limiter = RateLimiter(rate, jitter_range=(delay_min, delay_max))
++    budget = RequestBudget(max_requests)
++    config.MAX_EXPANSIONS_PER_LAYER = max_expand   # honor CLI override
++
++    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers,
++                         face_engine=engine, ref_emb=ref_emb,
++                         rate_limiter=limiter, budget=budget)
+     t0 = time.time()
+     results = await searcher.search(layer0, depth=depth)
+     elapsed = time.time() - t0
+ 
++    if searcher.stop_reason:
++        print(f"\n  STOPPED early (safety): {searcher.stop_reason}")
++
+     print(f"\nDone in {elapsed:.0f}s")
+     print(f"Faces detected: {len(searcher.results)}")
+ 
+     top = searcher.get_top(20)
+     print(f"\nTop 20:")
+     for u, s in top:
+         mark = " <<<" if s >= threshold else ""
+         print(f"  @{u}: {s*100:.1f}%{mark}")
+ 
+     if searcher.found_data[0]:
+diff --git a/modules/config.py b/modules/config.py
+index 60577c5..5a60065 100644
+--- a/modules/config.py
++++ b/modules/config.py
+@@ -12,10 +12,17 @@ os.makedirs(DATA_DIR, exist_ok=True)
+ os.makedirs(RESULTS_DIR, exist_ok=True)
+ 
+ COOKIE_STRING = ''
+ 
+ MODEL_NAME = "buffalo_l"
+ SIM_THRESHOLD = 0.35
+ PLAYWRIGHT_TIMEOUT = 15000
+ PAGE_WAIT = 1500
+ WORKERS = 3
+ MAX_DEPTH = 3
++
++# --- Rate-limit hardening ---
++RATE_PER_MIN = 20                 # global read pace (requests/min); 0 disables
++DELAY_RANGE = (1.0, 3.0)          # jittered inter-action delay (seconds)
++MAX_REQUESTS = 800                # per-run request budget; None disables
++MAX_EXPANSIONS_PER_LAYER = 15     # cap accounts expanded per BFS layer; None disables
++BACKOFF_CAP = 300                 # max backoff seconds (was hardcoded 30)
+diff --git a/modules/instagram.py b/modules/instagram.py
+index e2abf6d..268a46a 100644
+--- a/modules/instagram.py
++++ b/modules/instagram.py
+@@ -1,16 +1,22 @@
+ """
+ Instagram scraper — Playwright Async API
+ """
+ import json, re, random, asyncio
+ from playwright.async_api import async_playwright
+ 
++from modules import config
++from modules.ratelimit import (
++    RateLimiter, RequestBudget, backoff_delay,
++    detect_soft_block, SoftBlockError, jittered_delay,
++)
++
+ # Shared browser — one Playwright instance across all Instagram objects
+ _pw = None
+ _browser = None
+ _browser_lock = asyncio.Lock()
+ _owns_browser = False
+ 
+ async def ensure_browser(headless=True):
+     global _pw, _browser
+     if _pw is None:
+         async with _browser_lock:
+@@ -36,29 +42,32 @@ def parse_cookies(s):
+         if n == "rur":
+             v = v.replace("\\054", ",")
+         c.append({
+             "name": n.strip(), "value": v, "domain": ".instagram.com",
+             "path": "/", "httpOnly": n in ("sessionid", "csrftoken", "ds_user_id", "rur"),
+             "secure": True, "sameSite": "Lax"
+         })
+     return c
+ 
+ async def _backoff_wait(attempt):
+-    delay = min(2 ** attempt + random.uniform(0, 1), 30)
+-    print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})")
++    delay = backoff_delay(attempt, cap=config.BACKOFF_CAP)
++    print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})", flush=True)
+     await asyncio.sleep(delay)
+ 
+ class Instagram:
+-    def __init__(self, cookie_string, timeout=15000, skip_home=False):
++    def __init__(self, cookie_string, timeout=15000, skip_home=False,
++                 rate_limiter=None, budget=None):
+         self.cookie_string = cookie_string
+         self.timeout = timeout
+         self.skip_home = skip_home
++        self.rate_limiter = rate_limiter or RateLimiter(0)
++        self.budget = budget or RequestBudget(None)
+         self.ctx = None
+         self.page = None
+ 
+     async def __aenter__(self):
+         await ensure_browser()
+         self.ctx = await _browser.new_context(
+             viewport={"width": 1280, "height": 800},
+             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+         )
+         await self.ctx.add_cookies(parse_cookies(self.cookie_string))
+@@ -69,26 +78,34 @@ class Instagram:
+         return self
+ 
+     async def __aexit__(self, *args):
+         if self.page:
+             await self.page.close()
+         if self.ctx:
+             await self.ctx.close()
+ 
+     async def _goto_with_retry(self, url, wait_until="domcontentloaded"):
+         for attempt in range(5):
++            await self.rate_limiter.acquire()
++            await self.budget.spend()
+             try:
+                 r = await self.page.goto(url, wait_until=wait_until, timeout=self.timeout)
++                final_url = self.page.url
++                kind = detect_soft_block(r.status if r else 200, final_url, "")
++                if kind:
++                    raise SoftBlockError(kind, url)
+                 if r and r.status == 429:
+                     await _backoff_wait(attempt)
+                 else:
+                     return r
++            except SoftBlockError:
++                raise
+             except Exception:
+                 if attempt == 4:
+                     raise
+                 await _backoff_wait(attempt)
+ 
+     async def _click_text(self, text):
+         # Try exact match first
+         try:
+             el = self.page.get_by_text(text, exact=True).first
+             if await el.is_visible(timeout=3000):
+@@ -224,21 +241,21 @@ class Instagram:
+ 
+             if not max_id:
+                 if page_count <= 2:
+                     print(" — no more pages")
+                 break
+             if len(users) < 50 and new_count == 0:
+                 if page_count <= 2:
+                     print(" — last page")
+                 break
+ 
+-            await asyncio.sleep(0.5)
++            await asyncio.sleep(jittered_delay(0.5, 1.5))
+ 
+         if page_count > 2:
+             print(f"  API followers done: {len(all_users)} unique users in {page_count} pages")
+         return all_users
+ 
+     async def _api_following(self, username):
+         await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+         csrf = await self.page.evaluate('() => {var m = document.cookie.match(/csrftoken=([^;]+)/); return m ? m[1] : ""}')
+         if not csrf:
+             print("  API: No CSRF token")
+@@ -292,21 +309,21 @@ class Instagram:
+ 
+             if not max_id:
+                 if page_count <= 2:
+                     print(" — no more pages")
+                 break
+             if len(users) < 50 and new_count == 0:
+                 if page_count <= 2:
+                     print(" — last page")
+                 break
+ 
+-            await asyncio.sleep(0.5)
++            await asyncio.sleep(jittered_delay(0.5, 1.5))
+ 
+         if page_count > 2:
+             print(f"  API following done: {len(all_users)} unique users in {page_count} pages")
+         return all_users
+ 
+     _EXCLUDE = {'explore', 'reels', 'accounts', 'direct', 'stories'}
+ 
+     async def _scrape_modal(self, max_items=200):
+         usernames = []
+         seen = set()
+@@ -346,21 +363,21 @@ class Instagram:
+                 if(!d) return;
+                 var all = d.querySelectorAll('div');
+                 for(var el of all) {
+                     var cs = window.getComputedStyle(el);
+                     if((cs.overflowY === 'scroll' || cs.overflowY === 'auto') && el.scrollHeight > el.clientHeight) {
+                         el.scrollTop += el.clientHeight * 0.85;
+                         el.dispatchEvent(new Event('scroll', {bubbles: true}));
+                     }
+                 }
+             }""")
+-            await asyncio.sleep(0.7)
++            await asyncio.sleep(jittered_delay(0.7, 1.8))
+ 
+         return usernames
+ 
+     async def _page_followers(self, username):
+         try:
+             await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+             await self.page.wait_for_timeout(3000)
+             if not await self._click_text("followers"):
+                 print("  _page_followers: cannot find followers text")
+                 return None
+@@ -394,33 +411,38 @@ class Instagram:
+         return await self._page_following(username)
+ 
+     async def get_profile_pic(self, username):
+         if "instagram.com" not in self.page.url:
+             try:
+                 await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
+                 await self.page.wait_for_timeout(2000)
+             except Exception:
+                 pass
+ 
++        await self.rate_limiter.acquire()
++        await self.budget.spend()
+         url_data = await self.page.evaluate(f"""async () => {{
+             try {{
+                 var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
+                 if(!csrf) return null;
+                 var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
+                     headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
+                 }});
+                 if(!r.ok) return null;
+                 var data = await r.json();
+                 if(data && data.data && data.data.user) {{
+                     var u = data.data.user;
+                     return u.hd_profile_pic_url_info ? u.hd_profile_pic_url_info.url : u.profile_pic_url;
+                 }}
+                 return null;
+             }} catch(e) {{ return null; }}
+         }}""")
+         if not url_data:
+             return None, None
+ 
+         resp = await self.page.request.get(url_data)
++        kind = detect_soft_block(resp.status, url_data, "")
++        if kind:
++            raise SoftBlockError(kind, "profile_pic")
+         if resp.ok:
+             return url_data, await resp.body()
+         return url_data, None
+diff --git a/modules/ratelimit.py b/modules/ratelimit.py
+new file mode 100644
+index 0000000..6b5f6fc
+--- /dev/null
++++ b/modules/ratelimit.py
+@@ -0,0 +1,87 @@
++"""Rate-limit hardening primitives (pure + async)."""
++import asyncio
++import random
++
++
++def jittered_delay(lo, hi, rng=random):
++    """Random delay in [lo, hi]. Returns 0.0 when lo==hi==0."""
++    if hi <= lo:
++        return float(lo)
++    return rng.uniform(lo, hi)
++
++
++def backoff_delay(attempt, base=2.0, cap=300.0, rng=random):
++    """Exponential backoff with jitter, capped at `cap` seconds."""
++    return min(base ** attempt + rng.uniform(0, 1), cap)
++
++
++class RateLimiter:
++    """Global pacer: serializes acquire() so requests are >= min_interval apart."""
++
++    def __init__(self, rate_per_min, jitter_range=(0.0, 0.0), time_fn=None, sleep_fn=None):
++        self.min_interval = (60.0 / rate_per_min) if rate_per_min and rate_per_min > 0 else 0.0
++        self.jitter_range = jitter_range
++        self._time = time_fn or (lambda: asyncio.get_event_loop().time())
++        self._sleep = sleep_fn or asyncio.sleep
++        self._lock = asyncio.Lock()
++        self._next_allowed = 0.0
++
++    async def acquire(self):
++        if self.min_interval <= 0.0:
++            return
++        async with self._lock:
++            now = self._time()
++            wait = self._next_allowed - now
++            if wait > 0:
++                await self._sleep(wait)
++            extra = jittered_delay(*self.jitter_range)
++            self._next_allowed = self._time() + self.min_interval + extra
++
++
++class BudgetExceeded(Exception):
++    def __init__(self, spent, limit):
++        self.spent = spent
++        self.limit = limit
++        super().__init__(f"request budget exceeded: {spent} > {limit}")
++
++
++class RequestBudget:
++    """Counts total requests spent across the run; raises when over max_requests."""
++
++    def __init__(self, max_requests=None):
++        self.max_requests = max_requests
++        self.spent = 0
++        self._lock = asyncio.Lock()
++
++    async def spend(self, n=1):
++        async with self._lock:
++            self.spent += n
++            if self.max_requests is not None and self.spent > self.max_requests:
++                raise BudgetExceeded(self.spent, self.max_requests)
++
++
++class SoftBlockError(Exception):
++    def __init__(self, kind, detail=""):
++        self.kind = kind
++        super().__init__(("soft-block: %s %s" % (kind, detail)).strip())
++
++
++_BODY_MARKERS = [
++    ("checkpoint", "checkpoint_required"),
++    ("challenge", "challenge_required"),
++    ("feedback_required", "feedback_required"),
++]
++
++
++def detect_soft_block(status, url, body_text):
++    """Detect account-level soft blocks. 429 (throttle) is intentionally NOT one."""
++    if status == 429:
++        return None
++    if url and "/accounts/login" in url:
++        return "login_redirect"
++    if body_text:
++        low = body_text.lower()
++        for kind, marker in _BODY_MARKERS:
++            if marker in low:
++                return kind
++    return None
+diff --git a/modules/search.py b/modules/search.py
+index 529ffee..ced7454 100644
+--- a/modules/search.py
++++ b/modules/search.py
+@@ -1,66 +1,86 @@
+ """
+ Social graph BFS search — async face search through Instagram network.
+ """
+ import json, os, sys, asyncio
+ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ 
+ from modules import config
+ from modules.instagram import Instagram
+ from modules.face import FaceEngine
++from modules.ratelimit import SoftBlockError, BudgetExceeded
++
++
++def cap_expansions(candidates, max_per_layer):
++    """Return at most max_per_layer candidates (None => no cap)."""
++    if max_per_layer is None:
++        return list(candidates)
++    return list(candidates)[:max_per_layer]
++
+ 
+ class BFSSearch:
+-    def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None):
++    def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None,
++                 rate_limiter=None, budget=None):
+         self.ref_path = ref_image_path
+         self.cookie = cookie_string or config.COOKIE_STRING
+         self.workers = workers or config.WORKERS
+         if face_engine:
+             self.face = face_engine
+             self.ref_emb = ref_emb
+         else:
+             self.face = FaceEngine(config.MODEL_NAME)
+             self.ref_emb = self.face.get_embedding_from_path(ref_image_path)
+         if self.ref_emb is None:
+             raise ValueError(f"No face detected in reference image: {ref_image_path}")
+         self.checked_users = set()
+         self.checked_urls = set()
+         self.expanded_users = set()
+         self.results = []
+         self.found = asyncio.Event()
+         self.found_data = [None]
+         self.lock = asyncio.Lock()
+         self.total_face_checks = 0
++        self.rate_limiter = rate_limiter
++        self.budget = budget
++        self.stopped = asyncio.Event()
++        self.stop_reason = None
+ 
+     async def _check_one(self, username):
+         if self.found.is_set(): return None
+         async with self.lock:
+             if username in self.checked_users: return None
+             self.checked_users.add(username)
+ 
+         try:
+-            async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True) as ig:
++            async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True,
++                                  rate_limiter=self.rate_limiter, budget=self.budget) as ig:
+                 url, pic = await ig.get_profile_pic(username)
+                 if not pic: return None
+ 
+                 async with self.lock:
+                     if url in self.checked_urls: return None
+                     self.checked_urls.add(url)
+ 
+                 sim = self.face.compare_to_ref(pic, self.ref_emb)
+                 if sim is not None:
+                     async with self.lock:
+                         self.results.append((username, sim))
+                         self.total_face_checks += 1
+                     if sim >= config.SIM_THRESHOLD:
+                         self.found.set()
+                         self.found_data[0] = (username, sim)
+                         return (username, sim)
++        except (SoftBlockError, BudgetExceeded) as e:
++            self.stop_reason = str(e)
++            self.stopped.set()
++            self.found.set()   # reuse existing short-circuit to unwind everything
++            return None
+         except Exception as e:
+             print(f"  _check_one error @{username}: {e}", flush=True)
+         return None
+ 
+     async def search(self, usernames, depth=1, batch_label=""):
+         if self.found.is_set() or not usernames:
+             return []
+ 
+         label = batch_label or f"depth {depth}"
+         print(f"\n  [{label}] Checking {len(usernames)} accounts...", flush=True)
+@@ -98,34 +118,42 @@ class BFSSearch:
+             return []
+ 
+         # --- Phase 2: expand to next layer ---
+         if depth <= 1 or not expand_candidates:
+             return sorted(self.results, key=lambda x: -x[1])
+ 
+         expand = [u for u in expand_candidates if u not in self.expanded_users]
+         if not expand:
+             return sorted(self.results, key=lambda x: -x[1])
+ 
++        expand = cap_expansions(expand, config.MAX_EXPANSIONS_PER_LAYER)
++
+         print(f"\n  [{label}] Expanding {len(expand)} accounts ke depth {depth-1}...", flush=True)
+ 
+         for i, uname in enumerate(expand):
+             if self.found.is_set():
+                 break
+             async with self.lock:
+                 self.expanded_users.add(uname)
+ 
+             print(f"    [{i+1}/{len(expand)}] @{uname} fetching friends...", flush=True)
+ 
+             try:
+-                async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True) as ig:
++                async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True,
++                                      rate_limiter=self.rate_limiter, budget=self.budget) as ig:
+                     followers = await ig.get_followers(uname)
+                     following = await ig.get_following(uname)
++            except (SoftBlockError, BudgetExceeded) as e:
++                self.stop_reason = str(e)
++                self.stopped.set()
++                self.found.set()   # reuse existing short-circuit to unwind everything
++                break
+             except Exception as e:
+                 print(f"      Error fetching @{uname}: {e}", flush=True)
+                 continue
+ 
+             if followers:
+                 sub = [u for u in followers if u not in self.checked_users]
+                 if sub:
+                     print(f"      followers: {len(followers)} -> {len(sub)} baru", flush=True)
+                     await self.search(sub, depth - 1, f"{uname}/f")
+                     if self.found.is_set():
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+index 0000000..78c5011
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,3 @@
++[pytest]
++asyncio_mode = auto
++testpaths = tests
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+index 0000000..ee4ba01
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,2 @@
++pytest
++pytest-asyncio
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..4516849
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,5 @@
++import sys
++from pathlib import Path
++
++# Add project root to path so modules can be imported
++sys.path.insert(0, str(Path(__file__).parent.parent))
+diff --git a/tests/test_config.py b/tests/test_config.py
+new file mode 100644
+index 0000000..c5da33c
+--- /dev/null
++++ b/tests/test_config.py
+@@ -0,0 +1,9 @@
++from modules import config
++
++
++def test_hardening_defaults_exist():
++    assert config.RATE_PER_MIN == 20
++    assert config.DELAY_RANGE == (1.0, 3.0)
++    assert config.MAX_REQUESTS == 800
++    assert config.MAX_EXPANSIONS_PER_LAYER == 15
++    assert config.BACKOFF_CAP == 300
+diff --git a/tests/test_instagram_softblock.py b/tests/test_instagram_softblock.py
+new file mode 100644
+index 0000000..8c35e2c
+--- /dev/null
++++ b/tests/test_instagram_softblock.py
+@@ -0,0 +1,33 @@
++import pytest
++from modules.ratelimit import SoftBlockError, RateLimiter, RequestBudget
++from modules.instagram import Instagram
++
++
++class _FakeResp:
++    def __init__(self, status):
++        self.status = status
++
++
++class _FakePage:
++    def __init__(self, final_url, status=200):
++        self.url = final_url
++        self._status = status
++    async def goto(self, url, wait_until="domcontentloaded", timeout=0):
++        return _FakeResp(self._status)
++    async def evaluate(self, *a, **k):
++        return ""
++
++
++async def test_goto_raises_on_login_redirect():
++    ig = Instagram("sessionid=x", rate_limiter=RateLimiter(0), budget=RequestBudget())
++    ig.page = _FakePage("https://www.instagram.com/accounts/login/?next=/y/")
++    with pytest.raises(SoftBlockError) as ei:
++        await ig._goto_with_retry("https://www.instagram.com/y/")
++    assert ei.value.kind == "login_redirect"
++
++
++async def test_goto_ok_returns_response():
++    ig = Instagram("sessionid=x", rate_limiter=RateLimiter(0), budget=RequestBudget())
++    ig.page = _FakePage("https://www.instagram.com/y/", status=200)
++    r = await ig._goto_with_retry("https://www.instagram.com/y/")
++    assert r.status == 200
+diff --git a/tests/test_ratelimit.py b/tests/test_ratelimit.py
+new file mode 100644
+index 0000000..52c4da7
+--- /dev/null
++++ b/tests/test_ratelimit.py
+@@ -0,0 +1,95 @@
++import random
++from modules.ratelimit import jittered_delay, backoff_delay
++
++
++def test_jittered_delay_within_bounds():
++    rng = random.Random(0)
++    for _ in range(100):
++        d = jittered_delay(1.0, 3.0, rng=rng)
++        assert 1.0 <= d <= 3.0
++
++
++def test_jittered_delay_zero_range():
++    assert jittered_delay(0.0, 0.0) == 0.0
++
++
++def test_backoff_delay_grows_and_caps():
++    seq = [backoff_delay(a, base=2.0, cap=300.0, rng=random.Random(1)) for a in range(12)]
++    assert seq[0] < seq[3] < seq[6]         # grows
++    assert all(d <= 300.0 for d in seq)     # capped
++    assert seq[-1] == 300.0                  # deep attempt saturates cap
++
++
++import pytest
++from modules.ratelimit import RateLimiter
++
++
++async def test_rate_limiter_spaces_calls():
++    clock = {"t": 0.0}
++    slept = []
++
++    def time_fn():
++        return clock["t"]
++
++    async def sleep_fn(d):
++        slept.append(d)
++        clock["t"] += d          # advance virtual clock
++
++    rl = RateLimiter(rate_per_min=60, time_fn=time_fn, sleep_fn=sleep_fn)  # min_interval=1.0s
++    await rl.acquire()           # first: no wait
++    await rl.acquire()           # second: must wait ~1.0s
++    assert slept and abs(slept[-1] - 1.0) < 1e-6
++
++
++async def test_rate_limiter_disabled():
++    slept = []
++
++    async def sleep_fn(d):
++        slept.append(d)
++
++    rl = RateLimiter(rate_per_min=0, sleep_fn=sleep_fn)
++    await rl.acquire()
++    await rl.acquire()
++    assert slept == []           # disabled => never sleeps
++
++
++from modules.ratelimit import RequestBudget, BudgetExceeded
++
++
++async def test_budget_counts_and_raises():
++    b = RequestBudget(max_requests=3)
++    await b.spend()          # 1
++    await b.spend(2)         # 3 (== limit, still OK)
++    assert b.spent == 3
++    with pytest.raises(BudgetExceeded) as ei:
++        await b.spend()      # 4 > 3
++    assert ei.value.limit == 3
++    assert ei.value.spent == 4
++
++
++async def test_budget_unlimited_when_none():
++    b = RequestBudget(max_requests=None)
++    for _ in range(1000):
++        await b.spend()
++    assert b.spent == 1000
++
++
++from modules.ratelimit import detect_soft_block, SoftBlockError
++
++
++def test_detect_login_redirect():
++    assert detect_soft_block(200, "https://www.instagram.com/accounts/login/?next=/x/", "") == "login_redirect"
++
++
++def test_detect_body_markers():
++    assert detect_soft_block(400, "https://www.instagram.com/x/", '{"message":"checkpoint_required"}') == "checkpoint"
++    assert detect_soft_block(400, "u", '{"message":"challenge_required"}') == "challenge"
++    assert detect_soft_block(400, "u", '{"message":"feedback_required"}') == "feedback_required"
++
++
++def test_429_is_not_soft_block():
++    assert detect_soft_block(429, "https://www.instagram.com/x/", "rate limited") is None
++
++
++def test_clean_response_is_none():
++    assert detect_soft_block(200, "https://www.instagram.com/x/", '{"data":{"user":{}}}') is None
+diff --git a/tests/test_search_limits.py b/tests/test_search_limits.py
+new file mode 100644
+index 0000000..f090f00
+--- /dev/null
++++ b/tests/test_search_limits.py
+@@ -0,0 +1,12 @@
++from modules import config
++from modules.search import cap_expansions
++
++
++def test_cap_expansions_limits_count():
++    users = [f"u{i}" for i in range(50)]
++    assert cap_expansions(users, 15) == users[:15]
++
++
++def test_cap_expansions_none_disables():
++    users = ["a", "b", "c"]
++    assert cap_expansions(users, None) == users

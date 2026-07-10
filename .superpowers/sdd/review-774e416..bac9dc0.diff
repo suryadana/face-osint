@@ -1,0 +1,256 @@
+# Review package: 774e416..bac9dc0
+
+## Commits
+bac9dc0 feat(instagram): pace requests, jitter delays, detect soft-blocks (Playwright)
+
+## Files changed
+ modules/instagram.py              | 34 ++++++++++++++++++++++++++++------
+ tests/test_instagram_softblock.py | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/modules/instagram.py b/modules/instagram.py
+index e2abf6d..268a46a 100644
+--- a/modules/instagram.py
++++ b/modules/instagram.py
+@@ -1,16 +1,22 @@
+ """
+ Instagram scraper — Playwright Async API
+ """
+ import json, re, random, asyncio
+ from playwright.async_api import async_playwright
+ 
++from modules import config
++from modules.ratelimit import (
++    RateLimiter, RequestBudget, backoff_delay,
++    detect_soft_block, SoftBlockError, jittered_delay,
++)
++
+ # Shared browser — one Playwright instance across all Instagram objects
+ _pw = None
+ _browser = None
+ _browser_lock = asyncio.Lock()
+ _owns_browser = False
+ 
+ async def ensure_browser(headless=True):
+     global _pw, _browser
+     if _pw is None:
+         async with _browser_lock:
+@@ -36,29 +42,32 @@ def parse_cookies(s):
+         if n == "rur":
+             v = v.replace("\\054", ",")
+         c.append({
+             "name": n.strip(), "value": v, "domain": ".instagram.com",
+             "path": "/", "httpOnly": n in ("sessionid", "csrftoken", "ds_user_id", "rur"),
+             "secure": True, "sameSite": "Lax"
+         })
+     return c
+ 
+ async def _backoff_wait(attempt):
+-    delay = min(2 ** attempt + random.uniform(0, 1), 30)
+-    print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})")
++    delay = backoff_delay(attempt, cap=config.BACKOFF_CAP)
++    print(f"  Rate limited, retrying in {delay:.0f}s (attempt {attempt+1})", flush=True)
+     await asyncio.sleep(delay)
+ 
+ class Instagram:
+-    def __init__(self, cookie_string, timeout=15000, skip_home=False):
++    def __init__(self, cookie_string, timeout=15000, skip_home=False,
++                 rate_limiter=None, budget=None):
+         self.cookie_string = cookie_string
+         self.timeout = timeout
+         self.skip_home = skip_home
++        self.rate_limiter = rate_limiter or RateLimiter(0)
++        self.budget = budget or RequestBudget(None)
+         self.ctx = None
+         self.page = None
+ 
+     async def __aenter__(self):
+         await ensure_browser()
+         self.ctx = await _browser.new_context(
+             viewport={"width": 1280, "height": 800},
+             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+         )
+         await self.ctx.add_cookies(parse_cookies(self.cookie_string))
+@@ -69,26 +78,34 @@ class Instagram:
+         return self
+ 
+     async def __aexit__(self, *args):
+         if self.page:
+             await self.page.close()
+         if self.ctx:
+             await self.ctx.close()
+ 
+     async def _goto_with_retry(self, url, wait_until="domcontentloaded"):
+         for attempt in range(5):
++            await self.rate_limiter.acquire()
++            await self.budget.spend()
+             try:
+                 r = await self.page.goto(url, wait_until=wait_until, timeout=self.timeout)
++                final_url = self.page.url
++                kind = detect_soft_block(r.status if r else 200, final_url, "")
++                if kind:
++                    raise SoftBlockError(kind, url)
+                 if r and r.status == 429:
+                     await _backoff_wait(attempt)
+                 else:
+                     return r
++            except SoftBlockError:
++                raise
+             except Exception:
+                 if attempt == 4:
+                     raise
+                 await _backoff_wait(attempt)
+ 
+     async def _click_text(self, text):
+         # Try exact match first
+         try:
+             el = self.page.get_by_text(text, exact=True).first
+             if await el.is_visible(timeout=3000):
+@@ -224,21 +241,21 @@ class Instagram:
+ 
+             if not max_id:
+                 if page_count <= 2:
+                     print(" — no more pages")
+                 break
+             if len(users) < 50 and new_count == 0:
+                 if page_count <= 2:
+                     print(" — last page")
+                 break
+ 
+-            await asyncio.sleep(0.5)
++            await asyncio.sleep(jittered_delay(0.5, 1.5))
+ 
+         if page_count > 2:
+             print(f"  API followers done: {len(all_users)} unique users in {page_count} pages")
+         return all_users
+ 
+     async def _api_following(self, username):
+         await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+         csrf = await self.page.evaluate('() => {var m = document.cookie.match(/csrftoken=([^;]+)/); return m ? m[1] : ""}')
+         if not csrf:
+             print("  API: No CSRF token")
+@@ -292,21 +309,21 @@ class Instagram:
+ 
+             if not max_id:
+                 if page_count <= 2:
+                     print(" — no more pages")
+                 break
+             if len(users) < 50 and new_count == 0:
+                 if page_count <= 2:
+                     print(" — last page")
+                 break
+ 
+-            await asyncio.sleep(0.5)
++            await asyncio.sleep(jittered_delay(0.5, 1.5))
+ 
+         if page_count > 2:
+             print(f"  API following done: {len(all_users)} unique users in {page_count} pages")
+         return all_users
+ 
+     _EXCLUDE = {'explore', 'reels', 'accounts', 'direct', 'stories'}
+ 
+     async def _scrape_modal(self, max_items=200):
+         usernames = []
+         seen = set()
+@@ -346,21 +363,21 @@ class Instagram:
+                 if(!d) return;
+                 var all = d.querySelectorAll('div');
+                 for(var el of all) {
+                     var cs = window.getComputedStyle(el);
+                     if((cs.overflowY === 'scroll' || cs.overflowY === 'auto') && el.scrollHeight > el.clientHeight) {
+                         el.scrollTop += el.clientHeight * 0.85;
+                         el.dispatchEvent(new Event('scroll', {bubbles: true}));
+                     }
+                 }
+             }""")
+-            await asyncio.sleep(0.7)
++            await asyncio.sleep(jittered_delay(0.7, 1.8))
+ 
+         return usernames
+ 
+     async def _page_followers(self, username):
+         try:
+             await self._goto_with_retry(f"https://www.instagram.com/{username}/")
+             await self.page.wait_for_timeout(3000)
+             if not await self._click_text("followers"):
+                 print("  _page_followers: cannot find followers text")
+                 return None
+@@ -394,33 +411,38 @@ class Instagram:
+         return await self._page_following(username)
+ 
+     async def get_profile_pic(self, username):
+         if "instagram.com" not in self.page.url:
+             try:
+                 await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
+                 await self.page.wait_for_timeout(2000)
+             except Exception:
+                 pass
+ 
++        await self.rate_limiter.acquire()
++        await self.budget.spend()
+         url_data = await self.page.evaluate(f"""async () => {{
+             try {{
+                 var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1];
+                 if(!csrf) return null;
+                 var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
+                     headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
+                 }});
+                 if(!r.ok) return null;
+                 var data = await r.json();
+                 if(data && data.data && data.data.user) {{
+                     var u = data.data.user;
+                     return u.hd_profile_pic_url_info ? u.hd_profile_pic_url_info.url : u.profile_pic_url;
+                 }}
+                 return null;
+             }} catch(e) {{ return null; }}
+         }}""")
+         if not url_data:
+             return None, None
+ 
+         resp = await self.page.request.get(url_data)
++        kind = detect_soft_block(resp.status, url_data, "")
++        if kind:
++            raise SoftBlockError(kind, "profile_pic")
+         if resp.ok:
+             return url_data, await resp.body()
+         return url_data, None
+diff --git a/tests/test_instagram_softblock.py b/tests/test_instagram_softblock.py
+new file mode 100644
+index 0000000..8c35e2c
+--- /dev/null
++++ b/tests/test_instagram_softblock.py
+@@ -0,0 +1,33 @@
++import pytest
++from modules.ratelimit import SoftBlockError, RateLimiter, RequestBudget
++from modules.instagram import Instagram
++
++
++class _FakeResp:
++    def __init__(self, status):
++        self.status = status
++
++
++class _FakePage:
++    def __init__(self, final_url, status=200):
++        self.url = final_url
++        self._status = status
++    async def goto(self, url, wait_until="domcontentloaded", timeout=0):
++        return _FakeResp(self._status)
++    async def evaluate(self, *a, **k):
++        return ""
++
++
++async def test_goto_raises_on_login_redirect():
++    ig = Instagram("sessionid=x", rate_limiter=RateLimiter(0), budget=RequestBudget())
++    ig.page = _FakePage("https://www.instagram.com/accounts/login/?next=/y/")
++    with pytest.raises(SoftBlockError) as ei:
++        await ig._goto_with_retry("https://www.instagram.com/y/")
++    assert ei.value.kind == "login_redirect"
++
++
++async def test_goto_ok_returns_response():
++    ig = Instagram("sessionid=x", rate_limiter=RateLimiter(0), budget=RequestBudget())
++    ig.page = _FakePage("https://www.instagram.com/y/", status=200)
++    r = await ig._goto_with_retry("https://www.instagram.com/y/")
++    assert r.status == 200
