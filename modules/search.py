@@ -7,9 +7,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules import config
 from modules.instagram import Instagram
 from modules.face import FaceEngine
+from modules.ratelimit import SoftBlockError, BudgetExceeded
+
+
+def cap_expansions(candidates, max_per_layer):
+    """Return at most max_per_layer candidates (None => no cap)."""
+    if max_per_layer is None:
+        return list(candidates)
+    return list(candidates)[:max_per_layer]
+
 
 class BFSSearch:
-    def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None):
+    def __init__(self, ref_image_path, cookie_string=None, workers=None, face_engine=None, ref_emb=None,
+                 rate_limiter=None, budget=None):
         self.ref_path = ref_image_path
         self.cookie = cookie_string or config.COOKIE_STRING
         self.workers = workers or config.WORKERS
@@ -29,6 +39,10 @@ class BFSSearch:
         self.found_data = [None]
         self.lock = asyncio.Lock()
         self.total_face_checks = 0
+        self.rate_limiter = rate_limiter
+        self.budget = budget
+        self.stopped = asyncio.Event()
+        self.stop_reason = None
 
     async def _check_one(self, username):
         if self.found.is_set(): return None
@@ -37,7 +51,8 @@ class BFSSearch:
             self.checked_users.add(username)
 
         try:
-            async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True) as ig:
+            async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True,
+                                  rate_limiter=self.rate_limiter, budget=self.budget) as ig:
                 url, pic = await ig.get_profile_pic(username)
                 if not pic: return None
 
@@ -54,6 +69,11 @@ class BFSSearch:
                         self.found.set()
                         self.found_data[0] = (username, sim)
                         return (username, sim)
+        except (SoftBlockError, BudgetExceeded) as e:
+            self.stop_reason = str(e)
+            self.stopped.set()
+            self.found.set()   # reuse existing short-circuit to unwind everything
+            return None
         except Exception as e:
             print(f"  _check_one error @{username}: {e}", flush=True)
         return None
@@ -105,6 +125,8 @@ class BFSSearch:
         if not expand:
             return sorted(self.results, key=lambda x: -x[1])
 
+        expand = cap_expansions(expand, config.MAX_EXPANSIONS_PER_LAYER)
+
         print(f"\n  [{label}] Expanding {len(expand)} accounts ke depth {depth-1}...", flush=True)
 
         for i, uname in enumerate(expand):
@@ -116,9 +138,15 @@ class BFSSearch:
             print(f"    [{i+1}/{len(expand)}] @{uname} fetching friends...", flush=True)
 
             try:
-                async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True) as ig:
+                async with Instagram(self.cookie, timeout=config.PLAYWRIGHT_TIMEOUT, skip_home=True,
+                                      rate_limiter=self.rate_limiter, budget=self.budget) as ig:
                     followers = await ig.get_followers(uname)
                     following = await ig.get_following(uname)
+            except (SoftBlockError, BudgetExceeded) as e:
+                self.stop_reason = str(e)
+                self.stopped.set()
+                self.found.set()   # reuse existing short-circuit to unwind everything
+                break
             except Exception as e:
                 print(f"      Error fetching @{uname}: {e}", flush=True)
                 continue
