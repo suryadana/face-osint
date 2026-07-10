@@ -42,6 +42,7 @@ sys.path.insert(0, BASE)
 from modules.instagram import Instagram, close_shared_browser
 from modules.face import FaceEngine
 from modules.search import BFSSearch
+from modules.ratelimit import RateLimiter, RequestBudget
 from modules import config
 
 def resolve_cookie():
@@ -152,6 +153,10 @@ async def cmd_search(args):
         print("  --workers N   Parallel workers (default 3)")
         print("  --threshold X Match threshold 0-1 (default 0.35)")
         print("  --no-cache    Re-scrape followers/following, ignore saved cache")
+        print("  --rate N        Global read pace, requests/min (default 20; 0=off)")
+        print("  --max-requests N  Per-run request budget (default 800)")
+        print("  --max-expand N  Max accounts expanded per layer (default 15)")
+        print("  --delay-min X / --delay-max X  Jittered inter-action delay seconds")
         print("")
         print("Examples:")
         print("  face-osint search ref.jpg target_user --depth 1")
@@ -165,6 +170,10 @@ async def cmd_search(args):
     threshold = config.SIM_THRESHOLD
     depth = 1
     no_cache = False
+    rate = config.RATE_PER_MIN
+    max_requests = config.MAX_REQUESTS
+    max_expand = config.MAX_EXPANSIONS_PER_LAYER
+    delay_min, delay_max = config.DELAY_RANGE
 
     i = 2
     while i < len(args):
@@ -176,6 +185,16 @@ async def cmd_search(args):
             depth = int(args[i + 1]); i += 2
         elif args[i] == "--no-cache":
             no_cache = True; i += 1
+        elif args[i] == "--rate" and i + 1 < len(args):
+            rate = int(args[i + 1]); i += 2
+        elif args[i] == "--max-requests" and i + 1 < len(args):
+            max_requests = int(args[i + 1]); i += 2
+        elif args[i] == "--max-expand" and i + 1 < len(args):
+            max_expand = int(args[i + 1]); i += 2
+        elif args[i] == "--delay-min" and i + 1 < len(args):
+            delay_min = float(args[i + 1]); i += 2
+        elif args[i] == "--delay-max" and i + 1 < len(args):
+            delay_max = float(args[i + 1]); i += 2
         else:
             i += 1
 
@@ -219,10 +238,19 @@ async def cmd_search(args):
     print(f"\nLayer 0: {len(layer0)} unique accounts")
     print(f"Searching with {workers} parallel workers...")
 
-    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers, face_engine=engine, ref_emb=ref_emb)
+    limiter = RateLimiter(rate, jitter_range=(delay_min, delay_max))
+    budget = RequestBudget(max_requests)
+    config.MAX_EXPANSIONS_PER_LAYER = max_expand   # honor CLI override
+
+    searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers,
+                         face_engine=engine, ref_emb=ref_emb,
+                         rate_limiter=limiter, budget=budget)
     t0 = time.time()
     results = await searcher.search(layer0, depth=depth)
     elapsed = time.time() - t0
+
+    if searcher.stop_reason:
+        print(f"\n  STOPPED early (safety): {searcher.stop_reason}")
 
     print(f"\nDone in {elapsed:.0f}s")
     print(f"Faces detected: {len(searcher.results)}")
