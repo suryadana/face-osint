@@ -72,3 +72,24 @@ async def test_budget_unlimited_when_none():
     for _ in range(1000):
         await b.spend()
     assert b.spent == 1000
+
+
+from modules.ratelimit import detect_soft_block, SoftBlockError
+
+
+def test_detect_login_redirect():
+    assert detect_soft_block(200, "https://www.instagram.com/accounts/login/?next=/x/", "") == "login_redirect"
+
+
+def test_detect_body_markers():
+    assert detect_soft_block(400, "https://www.instagram.com/x/", '{"message":"checkpoint_required"}') == "checkpoint"
+    assert detect_soft_block(400, "u", '{"message":"challenge_required"}') == "challenge"
+    assert detect_soft_block(400, "u", '{"message":"feedback_required"}') == "feedback_required"
+
+
+def test_429_is_not_soft_block():
+    assert detect_soft_block(429, "https://www.instagram.com/x/", "rate limited") is None
+
+
+def test_clean_response_is_none():
+    assert detect_soft_block(200, "https://www.instagram.com/x/", '{"data":{"user":{}}}') is None

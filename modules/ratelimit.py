@@ -58,3 +58,30 @@ class RequestBudget:
             self.spent += n
             if self.max_requests is not None and self.spent > self.max_requests:
                 raise BudgetExceeded(self.spent, self.max_requests)
+
+
+class SoftBlockError(Exception):
+    def __init__(self, kind, detail=""):
+        self.kind = kind
+        super().__init__(("soft-block: %s %s" % (kind, detail)).strip())
+
+
+_BODY_MARKERS = [
+    ("checkpoint", "checkpoint_required"),
+    ("challenge", "challenge_required"),
+    ("feedback_required", "feedback_required"),
+]
+
+
+def detect_soft_block(status, url, body_text):
+    """Detect account-level soft blocks. 429 (throttle) is intentionally NOT one."""
+    if status == 429:
+        return None
+    if url and "/accounts/login" in url:
+        return "login_redirect"
+    if body_text:
+        low = body_text.lower()
+        for kind, marker in _BODY_MARKERS:
+            if marker in low:
+                return kind
+    return None
