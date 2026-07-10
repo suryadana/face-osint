@@ -222,6 +222,7 @@ async def cmd_search(args):
     print(f"  Threshold: {threshold*100:.0f}%")
     print(f"  Workers:   {workers}")
     print(f"  Depth:     {depth}")
+    print(f"  Posts:     {post_n}")
 
     limiter = RateLimiter(rate, jitter_range=(delay_min, delay_max))
     budget = RequestBudget(max_requests)

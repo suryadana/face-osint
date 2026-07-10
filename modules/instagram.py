@@ -471,10 +471,15 @@ class Instagram:
                 var r = await fetch('/api/v1/users/web_profile_info/?username={username}', {{
                     headers: {{'X-CSRFToken': csrf, 'X-IG-App-ID': '936619743392459'}}
                 }});
-                if(!r.ok) return null;
+                if(!r.ok){{ var t=""; try{{ t=await r.text(); }}catch(e){{}}; return {{__nonok:true, __status:r.status, __url:r.url, __body:(t||"").slice(0,500)}}; }}
                 return await r.json();
             }} catch(e) {{ return null; }}
         }}""")
+        if raw and raw.get("__nonok"):
+            kind = detect_soft_block(raw.get("__status", 0), raw.get("__url", ""), raw.get("__body", ""))
+            if kind:
+                raise SoftBlockError(kind, "profile_media")
+            return {"profile_pic_url": None, "post_urls": []}   # genuine non-2xx (e.g. 404), not a soft-block
         if not raw:
             return {"profile_pic_url": None, "post_urls": []}
         return parse_profile_media(raw)

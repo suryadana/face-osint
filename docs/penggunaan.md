@@ -128,6 +128,8 @@ Tiap akun dicek dengan foto profil **plus** hingga `--posts N` post terbaru (def
 - Sampling **berhenti lebih awal** begitu konsensus tercapai — post berikutnya tidak diunduh/dicek lagi untuk akun itu.
 - `--posts 0` mengembalikan ke perilaku lama (cuma foto profil, back-compat).
 
+> **Catatan konsensus:** dengan `--posts ≥ 1`, sebuah akun dihentikan-otomatis (FOUND) hanya jika **≥ `CONSENSUS_MIN` (default 2) gambar berbeda** melewati threshold. Akun yang cocok kuat hanya di profile pic (tanpa wajah cocok di post) tetap muncul peringkat teratas di top-list, tapi **tidak** menghentikan pencarian. Pakai `--posts 0` untuk perilaku lama (match dari 1 gambar).
+
 ---
 
 ## `list` — lihat hasil search
