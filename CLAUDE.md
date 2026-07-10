@@ -61,6 +61,12 @@ Four modules under `modules/`, orchestrated by the top-level `face-osint` script
 
 `search` reuses `{username}_followers.json` / `{username}_following.json` from `DATA_DIR` unless `--no-cache` is passed. Within a run, `checked_users`/`checked_urls`/`expanded_users` prevent re-checking accounts across depths.
 
+## Git & PR workflow
+
+- **New feature → new branch.** Never commit a feature straight to `main`/`dev`. Branch off the appropriate base (`git checkout -b <feature> dev`).
+- **PRs target the `dev` branch, not `main`.** `dev` is the integration branch on `origin`; `gh pr create --base dev --head <feature>`.
+- **Do NOT push or open PRs as Claude.** The machine's SSH key authenticates as a GitHub account without write access; the only account with access (`suryadana`) is the user's personal account and must not be used by the agent. Prepare the branch, commits, and PR title/body locally, then **let the user run the actual `git push` / `gh pr create`** (e.g. suggest `! git push ...`).
+
 ## Notes
 
 - Language of user-facing strings is mixed Indonesian/English (README is Indonesian); match the surrounding style when editing output.
