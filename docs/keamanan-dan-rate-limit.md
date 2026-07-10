@@ -50,6 +50,8 @@ Sejak rate-limit hardening (`modules/ratelimit.py`, wired ke `instagram.py`/`sea
 
 Catatan: default `--rate`/`--max-requests`/`--max-expand` mengurangi risiko secara signifikan dibanding sebelum hardening, tapi **tidak menghilangkan** risiko ban — lihat "Faktor risiko" dan "Playbook" di bawah untuk apa yang masih harus dilakukan manual (akun burner, IP residensial, dst).
 
+Lingkup: limiter/budget/soft-block-stop di atas mengatur seluruh jalur perintah `search` (termasuk seed-scrape layer-0 dan `--depth 0`, sejak semuanya berbagi `limiter`/`budget` yang sama). Perintah `pic`/`scrape` yang dijalankan berdiri sendiri (di luar `search`) tetap tidak diatur budget/limiter — volumenya rendah (satu-dua request per invocation) sehingga dianggap di luar scope hardening ini.
+
 ## Faktor risiko (kritis)
 
 - **Single sessionid/cookie** untuk seluruh burst — satu identitas menyerap semua traffic. *(belum dimitigasi — di luar scope hardening ini; butuh multi-akun/proxy, lihat playbook)*

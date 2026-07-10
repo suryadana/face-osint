@@ -1,7 +1,7 @@
 """
 Instagram scraper — Playwright Async API
 """
-import json, re, random, asyncio
+import json, re, asyncio
 from playwright.async_api import async_playwright
 
 from modules import config
@@ -412,11 +412,8 @@ class Instagram:
 
     async def get_profile_pic(self, username):
         if "instagram.com" not in self.page.url:
-            try:
-                await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=self.timeout)
-                await self.page.wait_for_timeout(2000)
-            except Exception:
-                pass
+            await self._goto_with_retry("https://www.instagram.com/")
+            await self.page.wait_for_timeout(2000)
 
         await self.rate_limiter.acquire()
         await self.budget.spend()

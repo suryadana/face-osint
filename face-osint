@@ -8,6 +8,10 @@ Commands:
     --depth N    Graph depth (1=direct, 2=friends-of-friends, 3=...)
     --workers N  Parallel checks (default 3)
     --threshold X  Match threshold 0-1 (default 0.35)
+    --rate N        Global read pace, requests/min (default 20; 0=off)
+    --max-requests N  Per-run request budget (default 800)
+    --max-expand N  Max accounts expanded per layer (default 15)
+    --delay-min X / --delay-max X  Jittered inter-action delay seconds
   scrape    <username> [options]                Scrape followers/following lists
   pic       <username> [options]                Download profile picture
   list      <file>                              List results from a saved search
@@ -106,8 +110,8 @@ def cmd_compare(args):
     print(f"  Match:      {'YES' if sim >= threshold else 'NO'}")
     return 0
 
-async def _depth0_check(engine, ref_emb, username, cookie, threshold):
-    async with Instagram(cookie) as ig:
+async def _depth0_check(engine, ref_emb, username, cookie, threshold, rate_limiter=None, budget=None):
+    async with Instagram(cookie, rate_limiter=rate_limiter, budget=budget) as ig:
         _, pic = await ig.get_profile_pic(username)
     if pic:
         sim = engine.compare_to_ref(pic, ref_emb)
@@ -120,11 +124,11 @@ async def _depth0_check(engine, ref_emb, username, cookie, threshold):
     else:
         print("  Could not get profile pic.")
 
-async def _scrape_user(username, cookie):
+async def _scrape_user(username, cookie, rate_limiter=None, budget=None):
     followers_path = os.path.join(config.DATA_DIR, f"{username}_followers.json")
     following_path = os.path.join(config.DATA_DIR, f"{username}_following.json")
 
-    async with Instagram(cookie) as ig:
+    async with Instagram(cookie, rate_limiter=rate_limiter, budget=budget) as ig:
         print("  Fetching followers...")
         followers = await ig.get_followers(username)
         if followers:
@@ -214,9 +218,13 @@ async def cmd_search(args):
     print(f"  Workers:   {workers}")
     print(f"  Depth:     {depth}")
 
+    limiter = RateLimiter(rate, jitter_range=(delay_min, delay_max))
+    budget = RequestBudget(max_requests)
+    config.MAX_EXPANSIONS_PER_LAYER = max_expand   # honor CLI override
+
     if depth == 0:
         print(f"\nChecking @{username}...")
-        await _depth0_check(engine, ref_emb, username, cookie, threshold)
+        await _depth0_check(engine, ref_emb, username, cookie, threshold, limiter, budget)
         await close_shared_browser()
         return 0
 
@@ -228,7 +236,7 @@ async def cmd_search(args):
             print(f"\n--no-cache: re-scraping @{username}...")
         else:
             print(f"\nScraping followers/following of @{username}...")
-        followers, following = await _scrape_user(username, cookie)
+        followers, following = await _scrape_user(username, cookie, limiter, budget)
     else:
         followers = json.load(open(followers_path))
         following = json.load(open(following_path))
@@ -237,10 +245,6 @@ async def cmd_search(args):
     layer0 = list(dict.fromkeys(followers + following))
     print(f"\nLayer 0: {len(layer0)} unique accounts")
     print(f"Searching with {workers} parallel workers...")
-
-    limiter = RateLimiter(rate, jitter_range=(delay_min, delay_max))
-    budget = RequestBudget(max_requests)
-    config.MAX_EXPANSIONS_PER_LAYER = max_expand   # honor CLI override
 
     searcher = BFSSearch(ref_path, cookie_string=cookie, workers=workers,
                          face_engine=engine, ref_emb=ref_emb,
