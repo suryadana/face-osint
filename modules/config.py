@@ -19,3 +19,10 @@ PLAYWRIGHT_TIMEOUT = 15000
 PAGE_WAIT = 1500
 WORKERS = 3
 MAX_DEPTH = 3
+
+# --- Rate-limit hardening ---
+RATE_PER_MIN = 20                 # global read pace (requests/min); 0 disables
+DELAY_RANGE = (1.0, 3.0)          # jittered inter-action delay (seconds)
+MAX_REQUESTS = 800                # per-run request budget; None disables
+MAX_EXPANSIONS_PER_LAYER = 15     # cap accounts expanded per BFS layer; None disables
+BACKOFF_CAP = 300                 # max backoff seconds (was hardcoded 30)
